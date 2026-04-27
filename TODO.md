@@ -100,6 +100,69 @@ no debería salir sin esto).
 - **Actualización del backlog:** cuando se cierre un ítem, mover a sección
   `## Cerrados` con commit hash. Cuando se descubra deuda nueva, agregar acá.
 
+## 7. `codex_models_manager` no usa auth.json para refresh (Fase 2.5)
+
+- **Origen:** Fase 2.5 (descubierto en validación live, 2026-04-27).
+- **Síntoma:** al arrancar `codrex exec -m minimax/...` aparece
+  `ERROR codex_models_manager::manager: failed to refresh available models:
+   Missing environment variable: MINIMAX_API_KEY`. La inferencia funciona
+  igual porque el adapter SÍ usa la resolution chain (env → auth.json →
+  error), pero el refresh de modelos al arranque solo lee de env.
+- **Disparador:** primer usuario que se confunda con el error spurious.
+- **Scope:** el módulo `codex-models-manager` debe pasar por la misma
+  resolution chain que el adapter (`resolve_credentials` en
+  `core/src/minimax_adapter.rs`). O simplemente skip silently cuando no
+  hay env var (el adapter cubrirá el caso real).
+- **Bloqueante de:** ninguno funcionalmente; cosmético pero engaña.
+- **Estimado:** 1-2 horas.
+
+## 8. `failed to record rollout items: thread X not found` (Fase 2.5)
+
+- **Origen:** Fase 2.5 (descubierto en validación live, 2026-04-27).
+- **Síntoma:** después de cada turno completado contra MiniMax aparece
+  `ERROR codex_core::session: failed to record rollout items: thread <id>
+   not found`. La respuesta del modelo se imprime correctamente, pero el
+  rollout/transcript no se persiste.
+- **Disparador:** cuando se quiera tener historial de sesiones MiniMax
+  (resume, fork, debugging post-mortem).
+- **Scope:** el `session_id` se genera al arranque del exec pero no se
+  registra en el `thread_store` antes del primer write attempt. Para
+  OpenAI funciona porque el flujo OAuth crea la entrada upstream; para
+  MiniMax falta el step equivalente (probablemente un
+  `thread_store.create(session_id)` en `Session::new` cuando provider !=
+  openai).
+- **Bloqueante de:** `codrex resume` y `codrex fork` con sesiones MiniMax.
+- **Riesgo:** medio (toca el thread_store que es shared).
+- **Estimado:** medio día con tests.
+
+## 9. Wire probe permanente (Fase 2.5)
+
+- **Origen:** Fase 2.5.
+- **Estado:** ya commiteado en `codex-rs/minimax/examples/wire_probe.rs`.
+  Útil para debugging futuro de errores opacos. No es deuda — solo nota.
+- **Uso:** `cargo run -p codex-minimax --example wire_probe`. Lee la key
+  de `~/.codex/auth.json` (o `CODREX_AUTH_PATH`) y corre una matriz de
+  probes contra api.minimax.io. Nunca expone la key en stdout.
+
+---
+
 ## Cerrados
 
-_(vacío al cierre de Fase 2.5)_
+- **2026-04-27 — `developer` role rejected by MiniMax**
+  Commit `ac3c0192c`. OpenAI's reasoning role remapped to `system` in
+  `normalize_role_for_minimax`. 3 regression tests.
+
+- **2026-04-27 — Two adjacent `system` messages rejected (HTTP 400 / 2013)**
+  Commit `c1579ac78`. `coalesce_consecutive_system_messages` merges runs
+  before wire send. 3 regression tests.
+
+- **2026-04-27 — Bridge panic: `ReasoningRawContentDelta without active item`**
+  Commit `c1579ac78`. Bridge synthesizes
+  `OutputItemAdded(Message)` lifecycle around streaming deltas, closes
+  with `OutputItemDone(Message)` before `Completed`. 5 regression tests.
+
+- **2026-04-27 — Wire-level debug dump on HTTP rejection**
+  Commit `c313ff8fe`. `CODREX_MINIMAX_DEBUG_WIRE=1` dumps the request
+  body alongside response on non-2xx, plus a `tracing::warn` at target
+  `codrex::minimax::wire`. Gated to avoid leaking conversation content
+  in production stderr.
