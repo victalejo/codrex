@@ -110,6 +110,39 @@ async fn main() -> anyhow::Result<()> {
             }),
         ),
         (
+            "05c-system at position 0 only (control)",
+            Box::new(|| {
+                json!({
+                    "model": model,
+                    "messages": [
+                        {"role":"system","content":"Be terse."},
+                        {"role":"user","content":"first"},
+                        {"role":"assistant","content":"ok"},
+                        {"role":"user","content":"reply ok"}
+                    ],
+                    "stream": false,
+                    "max_tokens": 8
+                })
+            }),
+        ),
+        (
+            "05d-system mid-conversation (resumed-session shape)",
+            Box::new(|| {
+                json!({
+                    "model": model,
+                    "messages": [
+                        {"role":"system","content":"Be terse."},
+                        {"role":"user","content":"first"},
+                        {"role":"assistant","content":"ok"},
+                        {"role":"system","content":"updated context"},
+                        {"role":"user","content":"reply ok"}
+                    ],
+                    "stream": false,
+                    "max_tokens": 8
+                })
+            }),
+        ),
+        (
             "06-full mirror of failing run (stream+reasoning_split+tools)",
             Box::new(|| {
                 json!({

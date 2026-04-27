@@ -110,14 +110,18 @@ pub fn translate_prompt(prompt: &Prompt, model: impl Into<String>) -> ChatComple
         messages.extend(translate_response_item(item));
     }
 
-    // Coalesce consecutive system messages — MiniMax rejects two adjacent
-    // system turns with HTTP 400 ("invalid chat setting (2013)"). This is
-    // common in Codex flows where base_instructions becomes one system
-    // message and a second system message arrives in the input (e.g.
-    // AGENTS.md context, environment setup, or developer instructions
-    // remapped from `developer` role). Joining with a blank line preserves
-    // both bodies and section boundaries readably for the model.
-    coalesce_consecutive_system_messages(&mut messages);
+    // Consolidate every `system`-role message into a single leading
+    // system turn. MiniMax rejects this in two distinct ways:
+    //   - two adjacent system turns       -> "invalid chat setting (2013)"
+    //   - any system turn after position 0 -> "chat content has invalid
+    //                                          message role: system (2013)"
+    // Both surface as opaque error code 2013 from
+    // `https://api.minimax.io/v1/chat/completions` and were observed live
+    // during Phase 2.5 validation (the second one only manifests on
+    // resumed sessions, where a turn_context refresh emits a mid-stream
+    // system message). Hoisting all system content to a single leading
+    // turn is content-preserving and the standard remediation.
+    consolidate_system_messages_to_leading(&mut messages);
 
     // Tools — collect Function variants natively, skip everything else with
     // a structured warn.
@@ -281,33 +285,42 @@ fn translate_tool(spec: &ToolSpec) -> Option<Tool> {
     }
 }
 
-/// Merge runs of consecutive `system`-role messages into a single message
-/// joined by a blank line. MiniMax returns error 2013 when it sees two
-/// adjacent system turns; merging is the standard remediation and is
-/// content-preserving (both bodies survive in the merged content).
+/// Hoist every `system`-role message to a single leading turn at index 0,
+/// joining their contents with blank lines (insertion order preserved).
 ///
-/// Empty system messages contribute nothing. Tool-calls and tool_call_ids
-/// are unreachable on system turns (Codex never sets them) so we don't
-/// need to merge them.
-fn coalesce_consecutive_system_messages(messages: &mut Vec<ChatMessage>) {
-    if messages.len() < 2 {
+/// MiniMax enforces two related constraints we discovered live:
+///   1. No two adjacent system messages.
+///   2. No system message after position 0.
+///
+/// Codex's prompt builder violates both naturally (base_instructions +
+/// AGENTS.md emits consecutive system turns; resumed sessions emit a
+/// `turn_context` refresh as a mid-stream system message). Consolidation
+/// to a single leading turn satisfies both rules without losing any
+/// content — the model still sees every instruction body in the order
+/// they were emitted.
+///
+/// Empty system messages are dropped silently; tool_calls / tool_call_id
+/// fields are unreachable on system turns (Codex never populates them)
+/// so we don't need to merge those.
+fn consolidate_system_messages_to_leading(messages: &mut Vec<ChatMessage>) {
+    if messages.is_empty() {
         return;
     }
-    let mut merged: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    let mut bodies: Vec<String> = Vec::new();
+    let mut non_system: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     for msg in messages.drain(..) {
-        if msg.role == "system"
-            && let Some(prev) = merged.last_mut()
-            && prev.role == "system"
-        {
-            if !prev.content.is_empty() && !msg.content.is_empty() {
-                prev.content.push_str("\n\n");
+        if msg.role == "system" {
+            if !msg.content.is_empty() {
+                bodies.push(msg.content);
             }
-            prev.content.push_str(&msg.content);
-            continue;
+        } else {
+            non_system.push(msg);
         }
-        merged.push(msg);
     }
-    *messages = merged;
+    if !bodies.is_empty() {
+        messages.push(ChatMessage::system(bodies.join("\n\n")));
+    }
+    messages.extend(non_system);
 }
 
 /// Map a Codex/OpenAI message role onto MiniMax's accepted set.
@@ -1102,23 +1115,63 @@ data: [DONE]\n\n";
         assert_eq!(user_count, 2, "user messages should remain distinct");
     }
 
+    /// Regression test: live validation revealed MiniMax also rejects
+    /// system messages that appear AFTER position 0 (error: "chat
+    /// content has invalid message role: system (2013)"). This shape
+    /// arises naturally on resumed sessions where Codex emits a
+    /// turn_context refresh as a mid-conversation system message.
+    /// Consolidation hoists ALL system content to a single leading turn.
     #[test]
-    fn translate_does_not_merge_non_adjacent_system_messages() {
-        // system / user / system should produce three messages — only
-        // adjacent runs collapse.
+    fn translate_hoists_non_leading_system_to_position_zero() {
         let mut prompt = Prompt::default();
         prompt.input.push(user_message("hi"));
         prompt.input.push(ResponseItem::Message {
             id: None,
-            role: "system".into(),
-            content: vec![ContentItem::InputText {
-                text: "mid-run rule injection".into(),
+            role: "assistant".into(),
+            content: vec![ContentItem::OutputText {
+                text: "earlier reply".into(),
             }],
             phase: None,
         });
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "system".into(),
+            content: vec![ContentItem::InputText {
+                text: "turn_context refresh".into(),
+            }],
+            phase: None,
+        });
+        prompt.input.push(user_message("now reply"));
         let req = translate_prompt(&prompt, "MiniMax-M2.7");
+
         let roles: Vec<&str> = req.messages.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, vec!["system", "user", "system"]);
+        assert_eq!(
+            roles,
+            vec!["system", "user", "assistant", "user"],
+            "non-leading system must be hoisted to position 0"
+        );
+        let leading_system = &req.messages[0];
+        assert!(
+            leading_system.content.contains("turn_context refresh"),
+            "hoisted system body must be merged into leading system content"
+        );
+    }
+
+    #[test]
+    fn translate_drops_empty_system_messages_during_consolidation() {
+        let mut prompt = Prompt::default();
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "system".into(),
+            content: vec![ContentItem::InputText { text: "".into() }],
+            phase: None,
+        });
+        prompt.input.push(user_message("hi"));
+        let req = translate_prompt(&prompt, "MiniMax-M2.7");
+        // Default base_instructions ensures one system; the empty input
+        // system contributes nothing additional.
+        let system_count = req.messages.iter().filter(|m| m.role == "system").count();
+        assert_eq!(system_count, 1);
     }
 
     #[test]
