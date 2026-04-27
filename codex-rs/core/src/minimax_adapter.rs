@@ -145,7 +145,7 @@ fn translate_response_item(item: ResponseItem) -> Vec<ChatMessage> {
                 );
             }
             vec![ChatMessage {
-                role,
+                role: normalize_role_for_minimax(role),
                 content: text,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
@@ -269,6 +269,36 @@ fn translate_tool(spec: &ToolSpec) -> Option<Tool> {
         | ToolSpec::LocalShell {}
         | ToolSpec::ImageGeneration { .. }
         | ToolSpec::WebSearch { .. } => None,
+    }
+}
+
+/// Map a Codex/OpenAI message role onto MiniMax's accepted set.
+///
+/// MiniMax (OpenAI-compatible chat completions, but stricter) only accepts
+/// `system | user | assistant | tool`. OpenAI's newer reasoning convention
+/// (`developer`) is not supported and produces error 2013 from the wire.
+/// We remap it to `system` since semantically the developer role plays the
+/// same instruction-giving function for the model.
+///
+/// Unknown roles are remapped to `user` (least-bad fallback that won't be
+/// rejected by the API) and a structured warn is emitted under
+/// `CODREX_ADAPTER_WARN_LOSSY=1`.
+fn normalize_role_for_minimax(role: String) -> String {
+    match role.as_str() {
+        "developer" => "system".to_string(),
+        "system" | "user" | "assistant" | "tool" => role,
+        unknown => {
+            if lossy_warns_enabled() {
+                warn!(
+                    adapter = "minimax",
+                    field = "role",
+                    original = unknown,
+                    remapped = "user",
+                    "unknown role remapped to 'user' for MiniMax wire compatibility"
+                );
+            }
+            "user".to_string()
+        }
     }
 }
 
@@ -929,5 +959,73 @@ data: [DONE]\n\n";
             .expect("user message present");
         assert!(user.content.contains("describe"));
         assert!(user.content.contains("[image:https://example.com/cat.png]"));
+    }
+
+    /// Regression test: OpenAI's `developer` role (used by reasoning models)
+    /// must be remapped to `system` before sending to MiniMax. The wire
+    /// rejects unknown roles with error 2013 ("invalid role: developer").
+    /// Bug surfaced live during Phase 2.5 validation against
+    /// `api.minimax.io` with model `MiniMax-M2.7`.
+    #[test]
+    fn translate_developer_role_remaps_to_system() {
+        let mut prompt = Prompt::default();
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "developer".into(),
+            content: vec![ContentItem::InputText {
+                text: "You are a helpful assistant.".into(),
+            }],
+            phase: None,
+        });
+        let req = translate_prompt(&prompt, "MiniMax-M2.7");
+
+        // No message in the wire payload should retain `role: developer`.
+        for msg in &req.messages {
+            assert_ne!(
+                msg.role, "developer",
+                "developer role leaked into MiniMax wire payload"
+            );
+            assert!(
+                matches!(msg.role.as_str(), "system" | "user" | "assistant" | "tool"),
+                "role '{}' is not in MiniMax's accepted set",
+                msg.role
+            );
+        }
+
+        // The remapped message should be present as a system turn with
+        // the original content preserved.
+        let remapped = req
+            .messages
+            .iter()
+            .find(|m| m.role == "system" && m.content == "You are a helpful assistant.")
+            .expect("developer message remapped to system with content preserved");
+        assert!(remapped.tool_calls.is_empty());
+        assert!(remapped.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn translate_canonical_roles_pass_through_unchanged() {
+        for canonical in ["system", "user", "assistant"] {
+            assert_eq!(
+                normalize_role_for_minimax(canonical.to_string()),
+                canonical,
+                "canonical role '{canonical}' should pass through unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn translate_unknown_role_falls_back_to_user() {
+        // Defensive: any future role we don't know about (e.g. a hypothetical
+        // 'function' or 'observer') should be remapped to 'user' rather than
+        // hitting the wire and getting rejected.
+        assert_eq!(
+            normalize_role_for_minimax("function".to_string()),
+            "user"
+        );
+        assert_eq!(
+            normalize_role_for_minimax("observer".to_string()),
+            "user"
+        );
     }
 }
