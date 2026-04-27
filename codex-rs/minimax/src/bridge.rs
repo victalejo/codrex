@@ -23,11 +23,13 @@ use crate::think_parser::ParsedSegment;
 use crate::think_parser::ThinkParser;
 use crate::types::Usage;
 use codex_api::ResponseEvent;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
 use std::collections::BTreeMap;
 use std::time::Instant;
 use tracing::info;
+use uuid::Uuid;
 
 /// Stateful translator from MiniMax stream chunks to `ResponseEvent`s.
 #[derive(Debug)]
@@ -49,6 +51,21 @@ pub struct ResponseEventBridge {
     /// When the bridge started consuming the stream — used to compute
     /// `latency_ms` at finalize.
     started_at: Instant,
+    /// Whether we've already emitted `OutputItemAdded(Message)` for this
+    /// stream's assistant turn. The Codex turn loop requires an active
+    /// item before any text/reasoning delta — without it, those deltas
+    /// trip a debug-mode panic and an error in release. MiniMax doesn't
+    /// emit a discrete "item start" event, so we synthesize one lazily on
+    /// the first delta and close it in `finalize`.
+    message_started: bool,
+    /// Synthetic id for the wrapping message item. Reused for the
+    /// matching `OutputItemDone(Message)` so callers see a coherent
+    /// open/close pair.
+    message_item_id: String,
+    /// Accumulated visible text to populate `OutputItemDone(Message)`
+    /// content. Reasoning bytes are excluded — they live in their own
+    /// channel and are surfaced via `ReasoningContentDelta` events.
+    accumulated_text: String,
 }
 
 impl Default for ResponseEventBridge {
@@ -63,6 +80,9 @@ impl Default for ResponseEventBridge {
             run_id: String::new(),
             model: String::new(),
             started_at: Instant::now(),
+            message_started: false,
+            message_item_id: String::new(),
+            accumulated_text: String::new(),
         }
     }
 }
@@ -94,6 +114,27 @@ impl ResponseEventBridge {
         }
     }
 
+    /// Lazily emit `OutputItemAdded(Message{role:"assistant"})` so the
+    /// turn loop has an `active_item` set before any text or reasoning
+    /// delta lands. Idempotent — subsequent calls are no-ops.
+    fn ensure_message_started(&mut self, out: &mut Vec<ResponseEvent>) {
+        if self.message_started {
+            return;
+        }
+        self.message_item_id = self
+            .response_id
+            .clone()
+            .map(|id| format!("msg-{id}"))
+            .unwrap_or_else(|| format!("msg-{}", Uuid::new_v4()));
+        out.push(ResponseEvent::OutputItemAdded(ResponseItem::Message {
+            id: Some(self.message_item_id.clone()),
+            role: "assistant".into(),
+            content: Vec::new(),
+            phase: None,
+        }));
+        self.message_started = true;
+    }
+
     /// Feed one streaming chunk; returns the events to emit immediately.
     pub fn ingest(&mut self, chunk: ChatCompletionChunk) -> Vec<ResponseEvent> {
         if self.response_id.is_none() && !chunk.id.is_empty() {
@@ -112,6 +153,7 @@ impl ResponseEventBridge {
             if let Some(reasoning) = choice.delta.reasoning_content
                 && !reasoning.is_empty()
             {
+                self.ensure_message_started(&mut out);
                 out.push(ResponseEvent::ReasoningContentDelta {
                     delta: reasoning,
                     content_index: self.reasoning_index,
@@ -125,9 +167,12 @@ impl ResponseEventBridge {
                 for seg in self.think_parser.push(&content) {
                     match seg {
                         ParsedSegment::Text(text) if !text.is_empty() => {
+                            self.ensure_message_started(&mut out);
+                            self.accumulated_text.push_str(&text);
                             out.push(ResponseEvent::OutputTextDelta(text));
                         }
                         ParsedSegment::Reasoning(text) if !text.is_empty() => {
+                            self.ensure_message_started(&mut out);
                             out.push(ResponseEvent::ReasoningContentDelta {
                                 delta: text,
                                 content_index: self.reasoning_index,
@@ -176,9 +221,12 @@ impl ResponseEventBridge {
         for seg in self.think_parser.flush() {
             match seg {
                 ParsedSegment::Text(text) if !text.is_empty() => {
+                    self.ensure_message_started(&mut out);
+                    self.accumulated_text.push_str(&text);
                     out.push(ResponseEvent::OutputTextDelta(text));
                 }
                 ParsedSegment::Reasoning(text) if !text.is_empty() => {
+                    self.ensure_message_started(&mut out);
                     out.push(ResponseEvent::ReasoningContentDelta {
                         delta: text,
                         content_index: self.reasoning_index,
@@ -187,6 +235,26 @@ impl ResponseEventBridge {
                 }
                 _ => {}
             }
+        }
+
+        // Close the synthetic Message wrapper before emitting any tool
+        // calls or the Completed event. Mirrors OpenAI's lifecycle:
+        // OutputItemAdded(Message) → deltas → OutputItemDone(Message)
+        // → OutputItemDone(FunctionCall)* → Completed.
+        if self.message_started {
+            let content = if self.accumulated_text.is_empty() {
+                Vec::new()
+            } else {
+                vec![ContentItem::OutputText {
+                    text: std::mem::take(&mut self.accumulated_text),
+                }]
+            };
+            out.push(ResponseEvent::OutputItemDone(ResponseItem::Message {
+                id: Some(self.message_item_id.clone()),
+                role: "assistant".into(),
+                content,
+                phase: None,
+            }));
         }
 
         // Emit a fully-realized FunctionCall item per accumulated call.
@@ -326,6 +394,140 @@ mod cost_log_tests {
         ));
         let _ = bridge.finalize();
         assert!(!logs_contain("stage=\"bridge.finalize\""));
+    }
+}
+
+/// Regression tests for the synthesized message-item lifecycle. Without
+/// these events the Codex turn loop trips the `error_or_panic` guard at
+/// `core/src/util.rs:97` ("OutputTextDelta/ReasoningRawContentDelta
+/// without active item") on the first delta of a real MiniMax stream.
+/// Bug surfaced live during Phase 2.5 validation.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::streaming::ChatCompletionChunk;
+
+    fn chunk(json: &str) -> ChatCompletionChunk {
+        serde_json::from_str(json).expect("valid chunk")
+    }
+
+    fn is_message_added(ev: &ResponseEvent) -> bool {
+        matches!(
+            ev,
+            ResponseEvent::OutputItemAdded(ResponseItem::Message {
+                role,
+                ..
+            }) if role == "assistant"
+        )
+    }
+    fn is_message_done(ev: &ResponseEvent) -> bool {
+        matches!(
+            ev,
+            ResponseEvent::OutputItemDone(ResponseItem::Message {
+                role,
+                ..
+            }) if role == "assistant"
+        )
+    }
+
+    #[test]
+    fn first_text_delta_is_preceded_by_output_item_added_message() {
+        let mut bridge = ResponseEventBridge::new();
+        let events = bridge.ingest(chunk(
+            r#"{"id":"resp-1","choices":[{"index":0,"delta":{"content":"Hello"}}]}"#,
+        ));
+        assert!(
+            events.first().is_some_and(is_message_added),
+            "expected OutputItemAdded(Message) before first text delta; got {:?}",
+            events
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ResponseEvent::OutputTextDelta(t) if t == "Hello")),
+            "text delta missing"
+        );
+    }
+
+    #[test]
+    fn first_reasoning_delta_is_preceded_by_output_item_added_message() {
+        let mut bridge = ResponseEventBridge::new();
+        let events = bridge.ingest(chunk(
+            r#"{"id":"resp-1","choices":[{"index":0,"delta":{"reasoning_content":"thinking..."}}]}"#,
+        ));
+        assert!(
+            events.first().is_some_and(is_message_added),
+            "expected OutputItemAdded(Message) before first reasoning delta; got {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn output_item_added_emitted_only_once_across_chunks() {
+        let mut bridge = ResponseEventBridge::new();
+        let mut all = bridge.ingest(chunk(
+            r#"{"id":"resp-1","choices":[{"index":0,"delta":{"content":"Hel"}}]}"#,
+        ));
+        all.extend(bridge.ingest(chunk(
+            r#"{"id":"resp-1","choices":[{"index":0,"delta":{"content":"lo"}}]}"#,
+        )));
+        all.extend(bridge.ingest(chunk(
+            r#"{"id":"resp-1","choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}"#,
+        )));
+        let count = all.iter().filter(|e| is_message_added(e)).count();
+        assert_eq!(
+            count, 1,
+            "OutputItemAdded(Message) must be emitted exactly once per stream"
+        );
+    }
+
+    #[test]
+    fn finalize_closes_message_with_accumulated_text() {
+        let mut bridge = ResponseEventBridge::new();
+        let _ = bridge.ingest(chunk(
+            r#"{"id":"resp-1","choices":[{"index":0,"delta":{"content":"OK"}}]}"#,
+        ));
+        let final_events = bridge.finalize();
+        let done = final_events
+            .iter()
+            .find(|e| is_message_done(e))
+            .expect("OutputItemDone(Message) emitted at finalize");
+        if let ResponseEvent::OutputItemDone(ResponseItem::Message { content, id, .. }) = done {
+            assert!(id.is_some(), "message item should carry a synthesized id");
+            assert_eq!(content.len(), 1);
+            assert!(matches!(
+                &content[0],
+                ContentItem::OutputText { text } if text == "OK"
+            ));
+        }
+        // OutputItemDone(Message) must come BEFORE Completed.
+        let done_idx = final_events.iter().position(is_message_done).unwrap();
+        let completed_idx = final_events
+            .iter()
+            .position(|e| matches!(e, ResponseEvent::Completed { .. }))
+            .unwrap();
+        assert!(
+            done_idx < completed_idx,
+            "OutputItemDone(Message) must precede Completed"
+        );
+    }
+
+    #[test]
+    fn finalize_skips_message_close_when_no_deltas() {
+        let bridge = ResponseEventBridge::new();
+        let final_events = bridge.finalize();
+        // Streams with zero content (just usage / finish_reason) should
+        // not invent a synthetic Message item.
+        assert!(
+            !final_events.iter().any(is_message_done),
+            "no Message lifecycle should be synthesized when nothing was emitted"
+        );
+        assert!(
+            final_events
+                .iter()
+                .any(|e| matches!(e, ResponseEvent::Completed { .. })),
+            "Completed should still fire"
+        );
     }
 }
 

@@ -25,11 +25,16 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-test = { workspace = true }
 wiremock = { workspace = true }
+
+[[example]]
+name = "wire_probe"
+path = "examples/wire_probe.rs"
 
 [lints]
 workspace = true

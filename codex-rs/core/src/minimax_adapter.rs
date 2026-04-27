@@ -110,6 +110,15 @@ pub fn translate_prompt(prompt: &Prompt, model: impl Into<String>) -> ChatComple
         messages.extend(translate_response_item(item));
     }
 
+    // Coalesce consecutive system messages — MiniMax rejects two adjacent
+    // system turns with HTTP 400 ("invalid chat setting (2013)"). This is
+    // common in Codex flows where base_instructions becomes one system
+    // message and a second system message arrives in the input (e.g.
+    // AGENTS.md context, environment setup, or developer instructions
+    // remapped from `developer` role). Joining with a blank line preserves
+    // both bodies and section boundaries readably for the model.
+    coalesce_consecutive_system_messages(&mut messages);
+
     // Tools — collect Function variants natively, skip everything else with
     // a structured warn.
     let mut tools: Vec<Tool> = Vec::new();
@@ -270,6 +279,35 @@ fn translate_tool(spec: &ToolSpec) -> Option<Tool> {
         | ToolSpec::ImageGeneration { .. }
         | ToolSpec::WebSearch { .. } => None,
     }
+}
+
+/// Merge runs of consecutive `system`-role messages into a single message
+/// joined by a blank line. MiniMax returns error 2013 when it sees two
+/// adjacent system turns; merging is the standard remediation and is
+/// content-preserving (both bodies survive in the merged content).
+///
+/// Empty system messages contribute nothing. Tool-calls and tool_call_ids
+/// are unreachable on system turns (Codex never sets them) so we don't
+/// need to merge them.
+fn coalesce_consecutive_system_messages(messages: &mut Vec<ChatMessage>) {
+    if messages.len() < 2 {
+        return;
+    }
+    let mut merged: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for msg in messages.drain(..) {
+        if msg.role == "system"
+            && let Some(prev) = merged.last_mut()
+            && prev.role == "system"
+        {
+            if !prev.content.is_empty() && !msg.content.is_empty() {
+                prev.content.push_str("\n\n");
+            }
+            prev.content.push_str(&msg.content);
+            continue;
+        }
+        merged.push(msg);
+    }
+    *messages = merged;
 }
 
 /// Map a Codex/OpenAI message role onto MiniMax's accepted set.
@@ -992,12 +1030,14 @@ data: [DONE]\n\n";
             );
         }
 
-        // The remapped message should be present as a system turn with
-        // the original content preserved.
+        // The remapped content should appear in a system turn. After the
+        // consecutive-system coalesce pass, the body may have been merged
+        // with base_instructions, so we assert containment rather than
+        // exact equality.
         let remapped = req
             .messages
             .iter()
-            .find(|m| m.role == "system" && m.content == "You are a helpful assistant.")
+            .find(|m| m.role == "system" && m.content.contains("You are a helpful assistant."))
             .expect("developer message remapped to system with content preserved");
         assert!(remapped.tool_calls.is_empty());
         assert!(remapped.tool_call_id.is_none());
@@ -1012,6 +1052,73 @@ data: [DONE]\n\n";
                 "canonical role '{canonical}' should pass through unchanged"
             );
         }
+    }
+
+    /// Regression test: the live failing run had two adjacent system
+    /// messages (Codex base_instructions + AGENTS.md). MiniMax responds
+    /// with HTTP 400 "invalid chat setting (2013)" in that case. The
+    /// adapter must merge them into one before sending.
+    #[test]
+    fn translate_merges_consecutive_system_messages() {
+        let mut prompt = Prompt::default();
+        // Default::default() puts a non-empty base_instructions, which
+        // produces the first system message. The second comes from input.
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "system".into(),
+            content: vec![ContentItem::InputText {
+                text: "AGENTS.md says: be terse.".into(),
+            }],
+            phase: None,
+        });
+        prompt.input.push(user_message("ping"));
+        let req = translate_prompt(&prompt, "MiniMax-M2.7");
+
+        let system_count = req.messages.iter().filter(|m| m.role == "system").count();
+        assert_eq!(
+            system_count, 1,
+            "consecutive system messages must be coalesced; got messages: {:?}",
+            req.messages.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+        let system = req
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .expect("system message present");
+        assert!(
+            system.content.contains("AGENTS.md says: be terse."),
+            "second system body must be preserved in merged content"
+        );
+    }
+
+    #[test]
+    fn translate_does_not_merge_user_messages() {
+        // User+user is allowed by MiniMax — must not be merged.
+        let mut prompt = Prompt::default();
+        prompt.input.push(user_message("first"));
+        prompt.input.push(user_message("second"));
+        let req = translate_prompt(&prompt, "MiniMax-M2.7");
+        let user_count = req.messages.iter().filter(|m| m.role == "user").count();
+        assert_eq!(user_count, 2, "user messages should remain distinct");
+    }
+
+    #[test]
+    fn translate_does_not_merge_non_adjacent_system_messages() {
+        // system / user / system should produce three messages — only
+        // adjacent runs collapse.
+        let mut prompt = Prompt::default();
+        prompt.input.push(user_message("hi"));
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "system".into(),
+            content: vec![ContentItem::InputText {
+                text: "mid-run rule injection".into(),
+            }],
+            phase: None,
+        });
+        let req = translate_prompt(&prompt, "MiniMax-M2.7");
+        let roles: Vec<&str> = req.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["system", "user", "system"]);
     }
 
     #[test]
