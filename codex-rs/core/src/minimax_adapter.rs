@@ -48,6 +48,40 @@
 //! Set `CODREX_ADAPTER_WARN_LOSSY=1` to enable the structured warns and
 //! collect telemetry on which variants actually appear in real workloads.
 //! That data should drive the Phase 3 priorities, in order of frequency.
+//!
+//! # MiniMax wire invariants discovered live
+//!
+//! These are HARD constraints enforced by `api.minimax.io/v1/chat/completions`.
+//! Violating them produces opaque error code 2013 (`bad_request_error`) where
+//! the human-readable message is reused for several distinct failure modes;
+//! the only reliable way to identify a violation is the wire dump enabled
+//! via `CODREX_MINIMAX_DEBUG_WIRE=1` and the regression probe matrix at
+//! `codex-rs/minimax/examples/wire_probe.rs`. Every invariant below is
+//! locked by at least one unit test in this file and one live probe.
+//!
+//! ```text
+//! Invariant                                  | Translation step                 | Tests
+//! -------------------------------------------|----------------------------------|----------------
+//! Roles MUST be {system,user,assistant,tool} | normalize_role_for_minimax       | translate_developer_role_remaps_to_system,
+//! (`developer` is rejected)                  | (developer -> system; unknown    | translate_unknown_role_falls_back_to_user
+//!                                            |  -> user with structured warn)   |
+//!                                            |                                  |
+//! System messages MUST be at position 0      | consolidate_system_messages_     | translate_merges_consecutive_system_messages,
+//! (a single leading turn — nothing later;    | to_leading                       | translate_hoists_non_leading_system_to_position_zero,
+//! no two adjacent system turns either)       | (collect every system body in    | translate_drops_empty_system_messages_during_consolidation
+//!                                            |  insertion order, drop empties,  |
+//!                                            |  emit one leading system,        |
+//!                                            |  preserve non-system order)      |
+//!                                            |                                  |
+//! User+user, user+assistant, etc. — fine     | (no-op)                          | translate_does_not_merge_user_messages
+//! ```
+//!
+//! When extending this adapter, run `cargo run -p codex-minimax --example
+//! wire_probe` against your dev key to verify any new field/shape doesn't
+//! trip a new 2013 we haven't catalogued yet. Add the constraint here
+//! and a test the moment one is found — opaque errors that aren't locked
+//! by a regression test will re-bite on resume, fork, or any future
+//! prompt-shape change.
 
 use std::sync::Arc;
 use std::time::Instant;
