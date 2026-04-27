@@ -41,6 +41,18 @@ impl MinimaxClient {
         &self.base_url
     }
 
+    /// Borrow the underlying HTTP client. Used by the streaming module so
+    /// that streaming and non-streaming requests reuse the same connection
+    /// pool and TLS configuration.
+    pub(crate) fn http_client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// Borrow the bearer token used for the `Authorization` header.
+    pub(crate) fn bearer_token(&self) -> &str {
+        &self.auth.bearer_token
+    }
+
     /// Issue a non-streaming chat completion. Streaming requests go through
     /// a separate entry point (added in a follow-up commit).
     pub async fn chat_completion(
