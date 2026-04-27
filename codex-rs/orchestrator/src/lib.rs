@@ -47,12 +47,17 @@
 pub mod context;
 pub mod decision;
 pub mod error;
+pub mod log;
 pub mod spec;
 pub mod traits;
 
 pub use context::DelegationContext;
 pub use decision::AuditDecision;
 pub use error::SpecError;
+pub use log::Clock;
+pub use log::InMemoryDecisionLog;
+pub use log::JsonlDecisionLog;
+pub use log::SystemClock;
 pub use spec::AcceptanceCriterion;
 pub use spec::DelegationSpec;
 pub use spec::ScriptRef;
@@ -64,6 +69,7 @@ pub use traits::ClassificationOutcome;
 pub use traits::DecisionLog;
 pub use traits::DispatchOutcome;
 pub use traits::DispatchSink;
+pub use traits::LogStage;
 
 /// Returns whether `CODREX_ORCH_DEBUG=1` is set in the environment.
 ///
