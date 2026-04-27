@@ -93,8 +93,8 @@ impl WidgetRef for &WelcomeWidget {
         lines.push(Line::from(vec![
             "  ".into(),
             "Welcome to ".into(),
-            "Codex".bold(),
-            ", OpenAI's command-line coding agent".into(),
+            "Codrex".bold(),
+            " — a fork of OpenAI Codex with MiniMax delegation for cost-efficient code generation".into(),
         ]));
 
         Paragraph::new(lines)
