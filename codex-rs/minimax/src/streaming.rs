@@ -125,6 +125,23 @@ impl MinimaxClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            if std::env::var("CODREX_MINIMAX_DEBUG_WIRE")
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty() && v != "0")
+            {
+                if let Ok(pretty) = serde_json::to_string_pretty(&request) {
+                    eprintln!(
+                        "[codrex/minimax] HTTP {} (stream) on {url}\n--- request body ---\n{pretty}\n--- response body ---\n{body}",
+                        status.as_u16()
+                    );
+                }
+            }
+            tracing::warn!(
+                target: "codrex::minimax::wire",
+                status = status.as_u16(),
+                response_body = %body,
+                "MiniMax streaming completion rejected; set CODREX_MINIMAX_DEBUG_WIRE=1 to dump request body"
+            );
             return Err(MinimaxError::Status {
                 status: status.as_u16(),
                 body,
