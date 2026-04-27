@@ -212,3 +212,8 @@ fn empty_stream_still_emits_completed() {
         other => panic!("expected Completed, got {other:?}"),
     }
 }
+
+// Cost-logging tests live in `src/bridge.rs` as a `#[cfg(test)] mod`
+// because `tracing_test` filters by the test binary's crate name; events
+// from `codex_minimax::bridge` are only captured when the assertion runs
+// from within the same crate.

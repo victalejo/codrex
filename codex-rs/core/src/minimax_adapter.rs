@@ -50,6 +50,7 @@
 //! That data should drive the Phase 3 priorities, in order of frequency.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use codex_api::ResponseEvent;
 use codex_minimax::AuthPreference;
@@ -72,7 +73,9 @@ use codex_protocol::models::ResponseItem;
 use codex_tools::ToolSpec;
 use futures::StreamExt;
 use tokio::sync::mpsc;
+use tracing::info;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::client_common::Prompt;
 use crate::client_common::ResponseStream;
@@ -349,15 +352,24 @@ pub async fn stream_chat_completions(
     let client = MinimaxClient::new(http_client, base_url, auth);
 
     let request = translate_prompt(prompt, model.to_string());
+    let started_at = Instant::now();
+    let run_id = Uuid::new_v4().to_string();
+    let model_for_log = model.to_string();
     let upstream = client
         .chat_completion_stream(&request)
         .await
         .map_err(map_minimax_err)?;
 
     let (tx, rx) = mpsc::channel::<CodexResult<ResponseEvent>>(64);
-    let bridge = Arc::new(tokio::sync::Mutex::new(ResponseEventBridge::new()));
+    let bridge_run_id = run_id.clone();
+    let bridge_model = model_for_log.clone();
+    let bridge = Arc::new(tokio::sync::Mutex::new(
+        ResponseEventBridge::with_telemetry(bridge_run_id, bridge_model, started_at),
+    ));
 
     let bridge_handle = bridge.clone();
+    let log_run_id = run_id.clone();
+    let log_model = model_for_log.clone();
     tokio::spawn(async move {
         let mut upstream = upstream;
         while let Some(item) = upstream.next().await {
@@ -368,6 +380,12 @@ pub async fn stream_chat_completions(
                         guard.ingest(chunk)
                     };
                     for ev in events {
+                        emit_cost_log_if_completed(
+                            &ev,
+                            &log_model,
+                            &log_run_id,
+                            started_at,
+                        );
                         if tx.send(Ok(ev)).await.is_err() {
                             return;
                         }
@@ -379,12 +397,17 @@ pub async fn stream_chat_completions(
                 }
             }
         }
-        // Drain finalize events.
+        // Drain finalize events. Replace the inner bridge with a fresh
+        // (telemetry-less) instance so any post-finalize ingest is a no-op
+        // — finalize is a one-shot. Adapter-side cost logging also
+        // inspects these events, since `Completed { token_usage }` is
+        // emitted by finalize, not by per-chunk ingest.
         let final_events = {
             let mut guard = bridge_handle.lock().await;
             std::mem::replace(&mut *guard, ResponseEventBridge::new()).finalize()
         };
         for ev in final_events {
+            emit_cost_log_if_completed(&ev, &log_model, &log_run_id, started_at);
             if tx.send(Ok(ev)).await.is_err() {
                 return;
             }
@@ -396,6 +419,39 @@ pub async fn stream_chat_completions(
 
 fn map_minimax_err(err: codex_minimax::MinimaxError) -> CodexErr {
     CodexErr::UnsupportedOperation(format!("minimax adapter: {err}"))
+}
+
+/// Adapter-side cost log emitted once per turn, when we observe the
+/// terminal `Completed` event carrying a `token_usage` block. Shares the
+/// generated `run_id` with the bridge-side log emitted from
+/// `ResponseEventBridge::finalize`, so log aggregators can correlate.
+fn emit_cost_log_if_completed(
+    ev: &ResponseEvent,
+    model: &str,
+    run_id: &str,
+    started_at: Instant,
+) {
+    if let ResponseEvent::Completed {
+        token_usage: Some(usage),
+        ..
+    } = ev
+    {
+        let latency_ms = started_at.elapsed().as_millis() as u64;
+        info!(
+            stage = "adapter.completed",
+            provider = "minimax",
+            model = %model,
+            endpoint = "chat_completions",
+            run_id = %run_id,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            cached_tokens = usage.cached_input_tokens,
+            reasoning_tokens = usage.reasoning_output_tokens,
+            total_tokens = usage.total_tokens,
+            latency_ms = latency_ms,
+            "codrex.cost"
+        );
+    }
 }
 
 /// Internal helper so the adapter can iterate over the prompt's tools
@@ -572,7 +628,11 @@ mod tests {
     /// dispatch against a wiremock server that streams a real-shape
     /// MiniMax SSE body, drain the resulting ResponseStream, and verify
     /// the translated `ResponseEvent` sequence.
+    ///
+    /// Also asserts that the structured cost-log fires from the adapter
+    /// side (commit 7) once a Completed event with usage is delivered.
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn e2e_prompt_to_response_stream_via_mock_minimax() {
         use codex_api::ResponseEvent;
         use codex_model_provider_info::ModelProviderInfo;
@@ -663,6 +723,18 @@ data: [DONE]\n\n";
 
         assert_eq!(text, "Hello, world");
         assert_eq!(completed, Some(6));
+
+        // Cost log assertions: adapter-side fires when a Completed with
+        // usage is delivered, bridge-side fires on finalize. Both share
+        // the same generated run_id so log aggregators can correlate.
+        assert!(logs_contain("stage=\"adapter.completed\""));
+        assert!(logs_contain("stage=\"bridge.finalize\""));
+        assert!(logs_contain("provider=\"minimax\""));
+        assert!(logs_contain("model=MiniMax-M2.7"));
+        assert!(logs_contain("input_tokens=4"));
+        assert!(logs_contain("output_tokens=2"));
+        assert!(logs_contain("total_tokens=6"));
+        assert!(logs_contain("codrex.cost"));
     }
 
     #[test]

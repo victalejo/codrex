@@ -2370,6 +2370,7 @@ dependencies = [
  "codex-hooks",
  "codex-login",
  "codex-mcp",
+ "codex-minimax",
  "codex-model-provider",
  "codex-model-provider-info",
  "codex-models-manager",
@@ -2939,6 +2940,8 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "tracing-test",
+ "uuid",
  "wiremock",
 ]
 
