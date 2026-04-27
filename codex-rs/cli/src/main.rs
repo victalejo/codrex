@@ -356,15 +356,24 @@ struct LoginCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
 
+    /// Optional non-OpenAI provider id (e.g. `minimax`).
+    ///
+    /// When omitted, Codrex runs the OpenAI ChatGPT OAuth flow exactly
+    /// like upstream Codex. When supplied, the matching provider gets
+    /// API-key credentials via the interactive prompt or one of the
+    /// `--with-api-key` / `--api-key` flags.
+    #[arg(value_name = "PROVIDER")]
+    provider: Option<String>,
+
     #[arg(
         long = "with-api-key",
-        help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`)"
+        help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | codrex login --with-api-key`)"
     )]
     with_api_key: bool,
 
     #[arg(
         long = "with-agent-identity",
-        help = "Read the experimental Agent Identity token from stdin (e.g. `printenv CODEX_AGENT_IDENTITY | codex login --with-agent-identity`)"
+        help = "Read the experimental Agent Identity token from stdin (e.g. `printenv CODEX_AGENT_IDENTITY | codrex login --with-agent-identity`)"
     )]
     with_agent_identity: bool,
 
@@ -373,10 +382,34 @@ struct LoginCommand {
         num_args = 0..=1,
         default_missing_value = "",
         value_name = "API_KEY",
-        help = "(deprecated) Previously accepted the API key directly; now exits with guidance to use --with-api-key",
+        help = "(deprecated) Pass the API key directly. Stays in shell history; prefer --with-api-key in scripts.",
         hide = true
     )]
     api_key: Option<String>,
+
+    /// Tag the saved credential as a Coding Plan key. Only meaningful
+    /// when a provider arg is supplied (today: `minimax`).
+    #[arg(long = "coding-plan", default_value_t = false)]
+    coding_plan: bool,
+
+    /// Optionally hit the provider's API once with the saved key to
+    /// verify it works. Default off in non-interactive flows; the
+    /// interactive prompt asks before running.
+    #[arg(long = "test-connection", default_value_t = false)]
+    test_connection: bool,
+
+    /// List provider credentials configured for Codrex. Mutually
+    /// exclusive with all other login flags.
+    #[arg(
+        long = "list",
+        default_value_t = false,
+        conflicts_with_all = [
+            "provider", "with_api_key", "with_agent_identity",
+            "api_key", "coding_plan", "use_device_code",
+            "test_connection"
+        ]
+    )]
+    list: bool,
 
     #[arg(long = "device-auth")]
     use_device_code: bool,
@@ -404,6 +437,14 @@ enum LoginSubcommand {
 struct LogoutCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
+
+    /// Optional provider id (e.g. `minimax`). When supplied, removes
+    /// only that provider's stored credentials; everything else
+    /// (OpenAI tokens, other providers) is preserved. When omitted,
+    /// behaves like upstream `codex logout` and clears the entire
+    /// auth payload.
+    #[arg(value_name = "PROVIDER")]
+    provider: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -949,7 +990,21 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                     run_login_status(login_cli.config_overrides).await;
                 }
                 None => {
-                    if login_cli.with_api_key && login_cli.with_agent_identity {
+                    if login_cli.list {
+                        codex_cli::run_login_list(login_cli.config_overrides).await;
+                    } else if let Some(provider_id) = login_cli.provider.clone() {
+                        codex_cli::run_provider_login(
+                            login_cli.config_overrides,
+                            provider_id,
+                            codex_cli::ProviderLoginInput {
+                                with_api_key: login_cli.with_api_key,
+                                api_key_inline: login_cli.api_key.clone(),
+                                coding_plan: login_cli.coding_plan,
+                                test_connection: login_cli.test_connection,
+                            },
+                        )
+                        .await;
+                    } else if login_cli.with_api_key && login_cli.with_agent_identity {
                         eprintln!(
                             "Choose one login credential source: --with-api-key or --with-agent-identity."
                         );
@@ -963,7 +1018,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                         .await;
                     } else if login_cli.api_key.is_some() {
                         eprintln!(
-                            "The --api-key flag is no longer supported. Pipe the key instead, e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`."
+                            "The --api-key flag is no longer supported. Pipe the key instead, e.g. `printenv OPENAI_API_KEY | codrex login --with-api-key`."
                         );
                         std::process::exit(1);
                     } else if login_cli.with_api_key {
@@ -989,7 +1044,14 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 &mut logout_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            run_logout(logout_cli.config_overrides).await;
+            match logout_cli.provider {
+                Some(provider_id) => {
+                    codex_cli::run_provider_logout(logout_cli.config_overrides, provider_id).await;
+                }
+                None => {
+                    run_logout(logout_cli.config_overrides).await;
+                }
+            }
         }
         Some(Subcommand::Completion(completion_cli)) => {
             reject_remote_mode_for_subcommand(

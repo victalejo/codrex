@@ -18,6 +18,7 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { workspace = true }
 codex-app-server = { workspace = true }
@@ -37,6 +38,7 @@ codex-features = { workspace = true }
 codex-login = { workspace = true }
 codex-mcp = { workspace = true }
 codex-mcp-server = { workspace = true }
+codex-minimax = { workspace = true }
 codex-models-manager = { workspace = true }
 codex-protocol = { workspace = true }
 codex-responses-api-proxy = { workspace = true }
@@ -48,10 +50,13 @@ codex-stdio-to-uds = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-tui = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-home-dir = { workspace = true }
 codex-utils-path = { workspace = true }
 libc = { workspace = true }
 owo-colors = { workspace = true }
 regex-lite = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+rpassword = { workspace = true }
 serde_json = { workspace = true }
 supports-color = { workspace = true }
 tempfile = { workspace = true }

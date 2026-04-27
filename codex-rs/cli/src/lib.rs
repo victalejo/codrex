@@ -1,6 +1,7 @@
 pub(crate) mod debug_sandbox;
 mod exit_status;
 pub(crate) mod login;
+pub(crate) mod provider_login;
 
 use clap::Parser;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -18,6 +19,10 @@ pub use login::run_login_with_chatgpt;
 pub use login::run_login_with_device_code;
 pub use login::run_login_with_device_code_fallback_to_browser;
 pub use login::run_logout;
+pub use provider_login::ProviderLoginInput;
+pub use provider_login::run_login_list;
+pub use provider_login::run_provider_login;
+pub use provider_login::run_provider_logout;
 
 #[derive(Debug, Parser)]
 pub struct SeatbeltCommand {
