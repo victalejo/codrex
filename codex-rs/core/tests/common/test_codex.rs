@@ -488,7 +488,7 @@ impl TestCodexBuilder {
         let mut config = load_default_config_for_test(home).await;
         config.cwd = cwd_override;
         config.model_provider = model_provider;
-        if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
+        if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codrex") {
             config.codex_self_exe = Some(path);
         } else if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex-exec") {
             // `codex-exec` also supports `--codex-run-as-apply-patch`, so use it

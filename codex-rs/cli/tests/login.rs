@@ -9,7 +9,7 @@ use tempfile::TempDir;
 const FAKE_AGENT_IDENTITY_JWT: &str = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhZ2VudF9ydW50aW1lX2lkIjoiYWdlbnQtcnVudGltZS1pZCIsImFnZW50X3ByaXZhdGVfa2V5IjoicHJpdmF0ZS1rZXkiLCJhY2NvdW50X2lkIjoiYWNjb3VudC0xMjMiLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLWlkIiwiZW1haWwiOiJ1c2VyQGV4YW1wbGUuY29tIiwicGxhbl90eXBlIjoicHJvIiwiY2hhdGdwdF9hY2NvdW50X2lzX2ZlZHJhbXAiOmZhbHNlfQ.c2ln";
 
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command> {
-    let mut cmd = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
+    let mut cmd = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codrex")?);
     cmd.env("CODEX_HOME", codex_home);
     Ok(cmd)
 }
