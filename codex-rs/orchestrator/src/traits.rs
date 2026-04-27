@@ -92,11 +92,44 @@ pub enum DispatchError {
     ClarificationRequested { question: String },
 }
 
+/// One acceptance criterion's evaluation result. The auditor returns a
+/// vec of these alongside its final `AuditDecision` so the caller can
+/// emit per-criterion JSONL log rows (`stage: "audit.criterion"`)
+/// before the aggregated `audit` row. Building dashboards of "which
+/// criteria fail most" is then a grep away.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CriterionResult {
+    /// Stable identifier — `"no_forbidden_patterns"`, `"output_matches[0]"`,
+    /// `"tests_pass"`, `"custom:<name>"`. Includes the index for
+    /// criteria that can repeat (`OutputMatches`, `Custom`).
+    pub name: String,
+    pub passed: bool,
+    pub duration_ms: u64,
+    /// Free-form payload describing the failure (or success): what
+    /// pattern matched, which test failed and on what assertion, what
+    /// the custom script's exit code + stderr was, etc. Phase 4 may
+    /// formalize this; Phase 3 keeps it as JSON for flexibility.
+    pub details: serde_json::Value,
+}
+
+/// What an `Auditor::audit()` call returns.
+///
+/// `criterion_results` records every criterion the auditor evaluated
+/// (in order). Short-circuit auditors stop at the first failure; the
+/// vec then ends with one `passed: false` entry and any later criteria
+/// are absent (not "passed: true" — absent means "not evaluated").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditReport {
+    pub decision: AuditDecision,
+    pub criterion_results: Vec<CriterionResult>,
+}
+
 /// Evaluates a `DispatchOutcome` against a `DelegationSpec` and decides
 /// the next step.
 ///
-/// Phase 3 commit 4 ships `PatternAuditor` (handles forbidden_patterns
-/// + simple acceptance criteria). Commit 5 adds the test runner branch.
+/// Phase 3 commit 4 ships `PatternAuditor` (handles forbidden_patterns,
+/// output regex, test runner, custom scripts). Commit 5 wires the
+/// retry/escalate/drop loop on top of the report.
 #[async_trait]
 pub trait Auditor: Send + Sync {
     async fn audit(
@@ -104,7 +137,7 @@ pub trait Auditor: Send + Sync {
         spec: &DelegationSpec,
         ctx: &DelegationContext,
         outcome: &DispatchOutcome,
-    ) -> AuditDecision;
+    ) -> AuditReport;
 }
 
 /// Append-only structured event log for a single delegation pipeline.
@@ -140,6 +173,10 @@ pub enum LogStage {
     Classify,
     DispatchStart,
     DispatchEnd,
+    /// One row per acceptance criterion the auditor evaluated. Emitted
+    /// BEFORE the aggregated `Audit` row. Greppable as
+    /// `"stage":"audit_criterion"` for per-criterion dashboards.
+    AuditCriterion,
     Audit,
     Decision,
     Clarify,

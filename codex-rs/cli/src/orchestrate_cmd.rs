@@ -24,12 +24,14 @@
 use std::path::PathBuf;
 
 use clap::Args;
+use codex_orchestrator::AcceptanceCriterion;
 use codex_orchestrator::AuditDecision;
 use codex_orchestrator::DelegationContext;
 use codex_orchestrator::DelegationSpec;
 use codex_orchestrator::JsonlDecisionLog;
 use codex_orchestrator::MinimaxDispatchSink;
-use codex_orchestrator::PlaceholderAuditor;
+use codex_orchestrator::PatternAuditor;
+use codex_orchestrator::TestSpec;
 use codex_orchestrator::traits::Auditor;
 use codex_orchestrator::traits::DecisionLog;
 use codex_orchestrator::traits::DispatchError;
@@ -64,6 +66,26 @@ pub struct OrchestrateCli {
     /// `<CODREX_HOME>/runs`. The directory is created on first write.
     #[arg(long)]
     pub log_dir: Option<PathBuf>,
+
+    /// Regex pattern the response must NOT match. Repeatable. Adds the
+    /// pattern to `DelegationSpec.forbidden_patterns` and implicitly
+    /// adds an `AcceptanceCriterion::NoForbiddenPatterns` (idempotent).
+    /// Validated as a real regex at parse time.
+    #[arg(long = "forbidden")]
+    pub forbidden: Vec<String>,
+
+    /// Regex pattern the response MUST match. Repeatable. Each entry
+    /// adds an `AcceptanceCriterion::OutputMatches`.
+    #[arg(long = "require-output-match")]
+    pub require_output_match: Vec<String>,
+
+    /// Shell-style command (split on whitespace) to run after the
+    /// dispatch. Sets `expected_tests` and adds an
+    /// `AcceptanceCriterion::TestsPass`. Quoting beyond plain
+    /// whitespace is not supported in Phase 3 — use a wrapper script
+    /// for that.
+    #[arg(long = "require-tests-cmd")]
+    pub require_tests_cmd: Option<String>,
 }
 
 pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
@@ -106,10 +128,36 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Build the delegation spec. Phase 3 LITE only sets `intent`; future
-    // commits surface `forbidden_patterns`, `expected_tests`, and
-    // `utility_refs` from rules / LLM classification.
-    let spec = DelegationSpec::new_bare(&cli.prompt)?;
+    // Build the delegation spec. Phase 3 commit 4 surfaces forbidden
+    // patterns, output regex, and a test command via flags so manual
+    // E2E demos can exercise every audit code path. Auto-classification
+    // arrives in commit 6 and replaces these with rules-driven config.
+    let mut spec = DelegationSpec::new_bare(&cli.prompt)?;
+    spec.forbidden_patterns = cli.forbidden.clone();
+    let mut acceptance: Vec<AcceptanceCriterion> = Vec::new();
+    if !cli.forbidden.is_empty() {
+        acceptance.push(AcceptanceCriterion::NoForbiddenPatterns);
+    }
+    for regex in &cli.require_output_match {
+        acceptance.push(AcceptanceCriterion::OutputMatches {
+            regex: regex.clone(),
+        });
+    }
+    if let Some(cmd_str) = cli.require_tests_cmd.as_deref()
+        && !cmd_str.trim().is_empty()
+    {
+        let parts: Vec<String> = cmd_str.split_whitespace().map(String::from).collect();
+        if !parts.is_empty() {
+            spec.expected_tests = Some(TestSpec {
+                command: parts,
+                working_dir: None,
+            });
+            acceptance.push(AcceptanceCriterion::TestsPass);
+        }
+    }
+    spec.acceptance = acceptance;
+    spec.validate()
+        .map_err(|e| anyhow::anyhow!("invalid spec built from flags: {e}"))?;
     let ctx = DelegationContext::for_top_level(&spec);
 
     log.record(
@@ -190,16 +238,34 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
     )
     .await;
 
-    let auditor = PlaceholderAuditor::new();
-    let decision = auditor.audit(&spec, &ctx, &outcome).await;
+    let auditor = PatternAuditor::new();
+    let report = auditor.audit(&spec, &ctx, &outcome).await;
+
+    // Emit one row per criterion BEFORE the aggregated audit row.
+    // Greppable as `"stage":"audit_criterion"` for dashboards of
+    // "which criteria fail most".
+    for cr in &report.criterion_results {
+        log.record(
+            &ctx,
+            LogStage::AuditCriterion,
+            serde_json::json!({
+                "name": cr.name,
+                "passed": cr.passed,
+                "duration_ms": cr.duration_ms,
+                "details": cr.details,
+            }),
+        )
+        .await;
+    }
+
     log.record(
         &ctx,
         LogStage::Audit,
-        serde_json::to_value(&decision).unwrap_or_else(|_| serde_json::json!({})),
+        serde_json::to_value(&report.decision).unwrap_or_else(|_| serde_json::json!({})),
     )
     .await;
 
-    let verdict_label = match &decision {
+    let verdict_label = match &report.decision {
         AuditDecision::Ok { .. } => "ok",
         AuditDecision::Retry { .. } => "retry",
         AuditDecision::Escalate { .. } => "escalate",
@@ -212,8 +278,31 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
     )
     .await;
 
+    // Phase 3 commit 4 LITE: the orchestrate command reports the
+    // verdict but doesn't yet act on Retry/Escalate/Drop (that wiring
+    // arrives in commit 5). For now we print the response and exit
+    // with a status code that signals the verdict to scripts.
     println!("{}", outcome.response_text);
-    Ok(())
+    match report.decision {
+        AuditDecision::Ok { .. } => Ok(()),
+        AuditDecision::Retry { feedback, attempt } => {
+            anyhow::bail!(
+                "audit verdict: retry (attempt {attempt}). Retry loop arrives in commit 5.\n\
+                 Feedback:\n{feedback}"
+            )
+        }
+        AuditDecision::Escalate {
+            reason,
+            blocking_issue,
+        } => {
+            anyhow::bail!(
+                "audit verdict: escalate. {reason}\nBlocking issue: {blocking_issue}"
+            )
+        }
+        AuditDecision::Drop { reason } => {
+            anyhow::bail!("audit verdict: drop. {reason}")
+        }
+    }
 }
 
 fn build_log(custom_dir: Option<&std::path::Path>) -> anyhow::Result<JsonlDecisionLog> {

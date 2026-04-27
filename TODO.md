@@ -137,6 +137,24 @@ no debería salir sin esto).
 - **Estimado si se quiere fixear localmente:** 2-3 horas (skip o suprimir
   el último persist cuando shutdown ya está en curso).
 
+## 11. Garantizar `usage` block en streaming MiniMax (Fase 3 commit 3)
+
+- **Origen:** observado en validación E2E del commit 3 (2026-04-27).
+  `total_tokens=null` en JSONL row `dispatch_end` y `codrex.cost` no
+  emite porque MiniMax-M2.7 no incluyó usage en la respuesta streamed.
+- **Disparador:** primera vez que querramos cost dashboards reales o
+  attribution per-delegation.
+- **Scope:** investigar si el endpoint MiniMax soporta
+  `stream_options: {"include_usage": true}` (convención OpenAI). Si lo
+  soporta, prenderlo por default en `ChatCompletionRequest` desde el
+  dispatcher del orquestador (y opcionalmente desde el adapter
+  general). Si no lo soporta, documentarlo y considerar fallback al
+  endpoint non-streaming para una llamada paralela mínima de usage —
+  con costo extra, evaluar trade-off.
+- **Bloqueante de:** ninguno funcional; bloquea visibility/cost dashboards.
+- **Estimado:** 1 hora (probe + setting), o medio día si requiere
+  fallback non-stream.
+
 ## 10. `TestSpec` LITE extensions (Fase 3 commit 1)
 
 - **Origen:** Fase 3 commit 1 (`codex-rs/orchestrator/src/spec.rs`).
