@@ -23,10 +23,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bridge;
 pub mod client;
 pub mod streaming;
+pub mod think_parser;
 pub mod types;
 
+pub use bridge::ResponseEventBridge;
 pub use client::MinimaxClient;
 
 /// Unique identifier for the MiniMax provider in the Codrex provider registry.
