@@ -37,23 +37,41 @@ pub const OPENAI_PROVIDER_ID: &str = "openai";
 const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
 pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
 pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str = "https://bedrock-mantle.us-east-1.api.aws/v1";
-const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
+/// Built-in MiniMax provider id. Codrex bundles MiniMax as a first-class
+/// provider so users can run `codrex --model minimax/MiniMax-M2.7 ...`
+/// without touching `config.toml`. The base URL can still be overridden
+/// per-request via the `MINIMAX_BASE_URL` env var (see `codex-minimax`).
+pub const MINIMAX_PROVIDER_ID: &str = "minimax";
+const MINIMAX_PROVIDER_NAME: &str = "MiniMax";
+const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimax.io/v1";
+const MINIMAX_API_KEY_ENV: &str = "MINIMAX_API_KEY";
+const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` (OpenAI Responses API) or `wire_api = \"chat_completions\"` (OpenAI-compatible chat completions, e.g. MiniMax) in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
 
 /// Wire protocol that the provider speaks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum WireApi {
     /// The Responses API exposed by OpenAI at `/v1/responses`.
     #[default]
     Responses,
+    /// OpenAI-compatible chat completions API (`/chat/completions`).
+    ///
+    /// Codrex re-introduces this variant to support providers like
+    /// MiniMax, Qwen, DeepSeek, and GLM which expose chat completions
+    /// rather than the OpenAI Responses API. The dispatch translates
+    /// Codex's internal Responses-shaped state into chat completions
+    /// requests and bridges the resulting stream back into
+    /// `ResponseEvent`s, so the rest of the agent is unaware.
+    ChatCompletions,
 }
 
 impl fmt::Display for WireApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Responses => "responses",
+            Self::ChatCompletions => "chat_completions",
         };
         f.write_str(value)
     }
@@ -67,8 +85,12 @@ impl<'de> Deserialize<'de> for WireApi {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "responses" => Ok(Self::Responses),
+            "chat_completions" => Ok(Self::ChatCompletions),
             "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
-            _ => Err(serde::de::Error::unknown_variant(&value, &["responses"])),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["responses", "chat_completions"],
+            )),
         }
     }
 }
@@ -374,6 +396,36 @@ impl ModelProviderInfo {
         }
     }
 
+    /// Build the built-in MiniMax provider entry. Codrex ships this as a
+    /// first-class provider so users can target MiniMax models directly via
+    /// `codrex --model minimax/MiniMax-M2.7 ...`.
+    pub fn create_minimax_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: MINIMAX_PROVIDER_NAME.into(),
+            base_url: Some(MINIMAX_DEFAULT_BASE_URL.into()),
+            env_key: Some(MINIMAX_API_KEY_ENV.into()),
+            env_key_instructions: Some(
+                "Generate a key at https://platform.minimax.io/ and \
+                 export it as MINIMAX_API_KEY (Coding Plan keys may also \
+                 be supplied via MINIMAX_CODING_PLAN_KEY)."
+                    .into(),
+            ),
+            experimental_bearer_token: None,
+            auth: None,
+            aws: None,
+            wire_api: WireApi::ChatCompletions,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        }
+    }
+
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }
@@ -405,10 +457,14 @@ pub fn built_in_model_providers(
     let openai_provider = P::create_openai_provider(openai_base_url);
     let amazon_bedrock_provider = P::create_amazon_bedrock_provider(/*aws*/ None);
 
-    // We do not want to be in the business of adjucating which third-party
-    // providers are bundled with Codex CLI, so we only include the OpenAI and
-    // open source ("oss") providers by default. Users are encouraged to add to
-    // `model_providers` in config.toml to add their own providers.
+    // Codrex bundles a curated set of first-class providers in the binary so
+    // common workflows work out of the box. Users can still extend this set
+    // via `model_providers` in `config.toml`.
+    //
+    // Specifically: MiniMax is included because Codrex's hybrid delegation
+    // model (Codex-as-architect + MiniMax-as-worker) treats MiniMax as a
+    // built-in worker; making users edit config.toml to use it would defeat
+    // the value of the fork.
     [
         (OPENAI_PROVIDER_ID, openai_provider),
         (AMAZON_BEDROCK_PROVIDER_ID, amazon_bedrock_provider),
@@ -420,6 +476,7 @@ pub fn built_in_model_providers(
             LMSTUDIO_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_LMSTUDIO_PORT, WireApi::Responses),
         ),
+        (MINIMAX_PROVIDER_ID, ModelProviderInfo::create_minimax_provider()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))

@@ -1532,6 +1532,17 @@ impl ModelClientSession {
                 )
                 .await
             }
+            WireApi::ChatCompletions => {
+                // Codrex re-introduced this variant for MiniMax-style
+                // providers; the request adapter (Prompt -> ChatCompletionRequest
+                // + chat completions stream -> ResponseStream) lands in the
+                // next commit. Fail fast with a clear error so anyone who
+                // explicitly opted into this wire api via config gets a
+                // helpful message instead of a panic.
+                Err(CodexErr::UnsupportedOperation(
+                    "wire_api = chat_completions is registered but the dispatcher is not yet wired up; this lands in a follow-up commit".into(),
+                ))
+            }
         }
     }
 
