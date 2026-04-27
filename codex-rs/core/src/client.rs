@@ -1533,15 +1533,20 @@ impl ModelClientSession {
                 .await
             }
             WireApi::ChatCompletions => {
-                // Codrex re-introduced this variant for MiniMax-style
-                // providers; the request adapter (Prompt -> ChatCompletionRequest
-                // + chat completions stream -> ResponseStream) lands in the
-                // next commit. Fail fast with a clear error so anyone who
-                // explicitly opted into this wire api via config gets a
-                // helpful message instead of a panic.
-                Err(CodexErr::UnsupportedOperation(
-                    "wire_api = chat_completions is registered but the dispatcher is not yet wired up; this lands in a follow-up commit".into(),
-                ))
+                // Codrex Phase 2 LITE adapter (see core/src/minimax_adapter.rs
+                // for the support matrix). Builds an HTTP client, translates
+                // the Codex-internal Prompt into a chat completions request,
+                // and streams MiniMax chunks back as ResponseEvents.
+                let provider_info = self.client.state.provider.info().clone();
+                let model = model_info.slug.clone();
+                let http = build_reqwest_client();
+                crate::minimax_adapter::stream_chat_completions(
+                    &provider_info,
+                    prompt,
+                    &model,
+                    http,
+                )
+                .await
             }
         }
     }
