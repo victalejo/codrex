@@ -116,24 +116,26 @@ no debería salir sin esto).
 - **Bloqueante de:** ninguno funcionalmente; cosmético pero engaña.
 - **Estimado:** 1-2 horas.
 
-## 8. `failed to record rollout items: thread X not found` (Fase 2.5)
+## 8. `failed to record rollout items: thread X not found` — UPSTREAM, COSMÉTICO
 
-- **Origen:** Fase 2.5 (descubierto en validación live, 2026-04-27).
-- **Síntoma:** después de cada turno completado contra MiniMax aparece
-  `ERROR codex_core::session: failed to record rollout items: thread <id>
-   not found`. La respuesta del modelo se imprime correctamente, pero el
-  rollout/transcript no se persiste.
-- **Disparador:** cuando se quiera tener historial de sesiones MiniMax
-  (resume, fork, debugging post-mortem).
-- **Scope:** el `session_id` se genera al arranque del exec pero no se
-  registra en el `thread_store` antes del primer write attempt. Para
-  OpenAI funciona porque el flujo OAuth crea la entrada upstream; para
-  MiniMax falta el step equivalente (probablemente un
-  `thread_store.create(session_id)` en `Session::new` cuando provider !=
-  openai).
-- **Bloqueante de:** `codrex resume` y `codrex fork` con sesiones MiniMax.
-- **Riesgo:** medio (toca el thread_store que es shared).
-- **Estimado:** medio día con tests.
+- **Origen:** pre-existente en upstream `codex-cli 0.125.0`. **No es
+  nuestro bug.** Reproducido verbatim corriendo `/opt/homebrew/bin/codex
+  exec` el 2026-04-27.
+- **Síntoma:** al cierre de cada `codex/codrex exec` aparece la línea
+  `ERROR codex_core::session: failed to record rollout items: thread X
+   not found`.
+- **Análisis:** el rollout file SÍ se escribe correctamente a disco antes
+  de que el shutdown remueva el recorder del map en memoria. La línea
+  ERROR es ruido del último `persist_rollout_items` que carrera con
+  `live_thread.shutdown()` — la persistencia real ya ocurrió.
+- **Verificación:** `codrex exec resume <session-id>` funciona
+  correctamente y reanuda con todo el historial. Tanto OpenAI como
+  MiniMax (post-fix `7f33ffe97`).
+- **Bloqueante de:** nada funcionalmente. Solo molesta visualmente.
+- **Plan:** **dejar dormido**. Probable PR upstream eventual; no
+  justifica deviation propia mientras el flujo funciona.
+- **Estimado si se quiere fixear localmente:** 2-3 horas (skip o suprimir
+  el último persist cuando shutdown ya está en curso).
 
 ## 9. Wire probe permanente (Fase 2.5)
 
@@ -166,3 +168,12 @@ no debería salir sin esto).
   body alongside response on non-2xx, plus a `tracing::warn` at target
   `codrex::minimax::wire`. Gated to avoid leaking conversation content
   in production stderr.
+
+- **2026-04-27 — Mid-conversation system messages rejected on resume
+  (HTTP 400 / 2013 — `chat content has invalid message role: system`)**
+  Commit `7f33ffe97`. Generalized the consecutive-system coalesce into
+  `consolidate_system_messages_to_leading`: hoists every system body to
+  a single leading turn, preserves insertion order, drops empties.
+  Required for `codrex resume` against MiniMax to work. Wire probes
+  05c/05d added to `wire_probe.rs` to lock the constraint live.
+  2 regression tests + 1 replaced.
