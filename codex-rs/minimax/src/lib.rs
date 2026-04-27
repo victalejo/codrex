@@ -23,6 +23,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
+pub mod types;
+
+pub use client::MinimaxClient;
+
 /// Unique identifier for the MiniMax provider in the Codrex provider registry.
 pub const MINIMAX_PROVIDER_ID: &str = "minimax";
 
