@@ -2388,6 +2388,13 @@
             "responses"
           ],
           "type": "string"
+        },
+        {
+          "description": "OpenAI-compatible chat completions API (`/chat/completions`).\n\nCodrex re-introduces this variant to support providers like MiniMax, Qwen, DeepSeek, and GLM which expose chat completions rather than the OpenAI Responses API. The dispatch translates Codex's internal Responses-shaped state into chat completions requests and bridges the resulting stream back into `ResponseEvent`s, so the rest of the agent is unaware.",
+          "enum": [
+            "chat_completions"
+          ],
+          "type": "string"
         }
       ]
     }
