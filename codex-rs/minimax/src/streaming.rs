@@ -19,6 +19,34 @@ use futures::StreamExt;
 use serde::Deserialize;
 use std::pin::Pin;
 
+/// One incremental tool-call update inside a streaming chunk. MiniMax (like
+/// OpenAI) sends partial tool calls indexed by their position in the
+/// assistant message; the consumer must accumulate by `index`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ToolCallChunk {
+    /// Position in the assistant message — used to merge chunks together.
+    #[serde(default)]
+    pub index: u32,
+    /// Stable id of the tool call (only present in the first chunk of a
+    /// given call on most servers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<ToolCallFunctionChunk>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ToolCallFunctionChunk {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// JSON-encoded argument fragment. Concatenate fragments across chunks
+    /// to reconstruct the full argument string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
 /// One incremental update in a streamed chat completion.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ChatCompletionChunk {
@@ -57,6 +85,10 @@ pub struct ChunkDelta {
     /// Contains the streamed reasoning text for this chunk.
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// Streamed tool-call deltas. Each entry must be merged with prior
+    /// entries that share the same `index` to reconstruct a full call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallChunk>,
 }
 
 /// Boxed pin'd stream alias used by the public API.
