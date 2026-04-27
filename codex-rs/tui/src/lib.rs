@@ -797,6 +797,12 @@ pub async fn run_main(
         chatgpt_base_url,
     );
 
+    // Resolve `--model provider/model` syntax + the `--provider` flag.
+    // Errors here are surfaced to the user immediately (bad CLI args).
+    let resolved_selection = cli
+        .resolve_model_and_provider()
+        .map_err(std::io::Error::other)?;
+
     let model_provider_override = if cli.oss {
         let resolved = resolve_oss_provider(
             cli.oss_provider.as_deref(),
@@ -817,12 +823,14 @@ pub async fn run_main(
             Some(provider)
         }
     } else {
-        None
+        // Honor an explicit provider from `--provider` or the
+        // `provider/model` prefix on `--model`.
+        resolved_selection.provider.clone()
     };
 
     // When using `--oss`, let the bootstrapper pick the model based on selected provider
-    let model = if let Some(model) = &cli.model {
-        Some(model.clone())
+    let model = if let Some(model) = resolved_selection.model.clone() {
+        Some(model)
     } else if cli.oss {
         // Use the provider from model_provider_override
         model_provider_override

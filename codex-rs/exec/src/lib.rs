@@ -235,11 +235,17 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         config_overrides,
     } = cli;
     let shared = shared.into_inner();
+    // Reconcile `--model provider/model` and `--provider` before
+    // destructuring so the resolved values flow downstream cleanly.
+    let resolved_selection = shared
+        .resolve_model_and_provider()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let SharedCliOptions {
         images,
-        model: model_cli_arg,
+        model: _model_cli_raw,
         oss,
         oss_provider,
+        model_provider: _model_provider_cli_raw,
         config_profile,
         sandbox_mode: sandbox_mode_cli_arg,
         full_auto,
@@ -247,6 +253,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         cwd,
         add_dir,
     } = shared;
+    let model_cli_arg = resolved_selection.model.clone();
+    let provider_cli_arg = resolved_selection.provider.clone();
 
     let (_stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
@@ -368,7 +376,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             ));
         }
     } else {
-        None // No OSS mode enabled
+        // Honor `--provider` and the `provider/model` prefix on `--model`.
+        provider_cli_arg.clone()
     };
 
     // When using `--oss`, let the bootstrapper pick the model based on selected provider
