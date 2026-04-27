@@ -158,6 +158,7 @@ codex-login = { path = "login" }
 codex-mcp = { path = "codex-mcp" }
 codex-mcp-server = { path = "mcp-server" }
 codex-minimax = { path = "minimax" }
+codex-orchestrator = { path = "orchestrator" }
 codex-model-provider-info = { path = "model-provider-info" }
 codex-models-manager = { path = "models-manager" }
 codex-network-proxy = { path = "network-proxy" }

@@ -45,6 +45,7 @@ mod app_cmd;
 mod desktop_app;
 mod marketplace_cmd;
 mod mcp_cmd;
+mod orchestrate_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
@@ -172,6 +173,15 @@ enum Subcommand {
 
     /// Inspect feature flags.
     Features(FeaturesCli),
+
+    /// Phase 3 — orchestrate a delegated turn through MiniMax.
+    ///
+    /// Runs the prompt through the orchestrator pipeline (classify →
+    /// dispatch → audit → log). Phase 3 commit 3 requires
+    /// `--force-delegate` or `--no-delegate`; auto-classification
+    /// arrives in commit 6.
+    #[clap(visible_alias = "o")]
+    Orchestrate(orchestrate_cmd::OrchestrateCli),
 }
 
 #[derive(Debug, Parser)]
@@ -1182,6 +1192,14 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 run_execpolicycheck(cmd)?
             }
         },
+        Some(Subcommand::Orchestrate(orch_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "orchestrate",
+            )?;
+            orchestrate_cmd::run_orchestrate(orch_cli).await?;
+        }
         Some(Subcommand::Apply(mut apply_cli)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),

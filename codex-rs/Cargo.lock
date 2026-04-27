@@ -2119,6 +2119,7 @@ dependencies = [
  "codex-mcp-server",
  "codex-minimax",
  "codex-models-manager",
+ "codex-orchestrator",
  "codex-protocol",
  "codex-responses-api-proxy",
  "codex-rmcp-client",
@@ -3069,15 +3070,24 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "codex-api",
+ "codex-config",
+ "codex-login",
+ "codex-minimax",
+ "codex-utils-home-dir",
+ "futures",
  "pretty_assertions",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
+ "serial_test",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -44,15 +44,19 @@
 //! local debugging — it's gated to keep production stderr quiet. See
 //! [`orch_debug_enabled`].
 
+pub mod audit;
 pub mod context;
 pub mod decision;
+pub mod dispatch;
 pub mod error;
 pub mod log;
 pub mod spec;
 pub mod traits;
 
+pub use audit::PlaceholderAuditor;
 pub use context::DelegationContext;
 pub use decision::AuditDecision;
+pub use dispatch::MinimaxDispatchSink;
 pub use error::SpecError;
 pub use log::Clock;
 pub use log::InMemoryDecisionLog;
