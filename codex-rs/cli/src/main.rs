@@ -1919,18 +1919,18 @@ mod tests {
 
     #[test]
     fn plugin_marketplace_help_uses_plugin_namespace() {
-        let help = help_from_args(&["codex", "plugin", "marketplace", "--help"]);
+        let help = help_from_args(&["codrex", "plugin", "marketplace", "--help"]);
         assert!(
-            help.contains("Usage: codex plugin marketplace [OPTIONS] <COMMAND>"),
+            help.contains("Usage: codrex plugin marketplace [OPTIONS] <COMMAND>"),
             "{help}"
         );
 
         for (subcommand, usage) in [
-            ("add", "Usage: codex plugin marketplace add"),
-            ("upgrade", "Usage: codex plugin marketplace upgrade"),
-            ("remove", "Usage: codex plugin marketplace remove"),
+            ("add", "Usage: codrex plugin marketplace add"),
+            ("upgrade", "Usage: codrex plugin marketplace upgrade"),
+            ("remove", "Usage: codrex plugin marketplace remove"),
         ] {
-            let help = help_from_args(&["codex", "plugin", "marketplace", subcommand, "--help"]);
+            let help = help_from_args(&["codrex", "plugin", "marketplace", subcommand, "--help"]);
             assert!(help.contains(usage), "{help}");
         }
     }
