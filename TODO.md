@@ -137,6 +137,24 @@ no debería salir sin esto).
 - **Estimado si se quiere fixear localmente:** 2-3 horas (skip o suprimir
   el último persist cuando shutdown ya está en curso).
 
+## 10. `TestSpec` LITE extensions (Fase 3 commit 1)
+
+- **Origen:** Fase 3 commit 1 (`codex-rs/orchestrator/src/spec.rs`).
+- **Disparador:** primer caso real donde un test corre largo y necesita
+  timeout, o cuando queremos retry feedback estructurado por test
+  fallido (no el blob entero de stdout).
+- **Scope:** extender `TestSpec` con:
+  - `timeout: Option<Duration>` — kill el proceso si excede.
+  - `expected_exit_code: i32` (default `0`) — útil para test runners
+    que devuelven códigos no-cero en éxito (e.g. property-based con
+    failures conocidos).
+  - parser estructurado de output: TAP / JUnit XML / cargo-nextest JSON.
+    Permite que `AuditDecision::Retry { feedback }` cite "test
+    `validate_email_invalid` falló: expected ValidationError, got
+    Email" en vez de pegar el stdout entero.
+- **Bloqueante de:** retry inteligente en Phase 4-5.
+- **Estimado:** medio día (3 fields + parser modular, gated por enum).
+
 ## 9. Wire probe permanente (Fase 2.5)
 
 - **Origen:** Fase 2.5.

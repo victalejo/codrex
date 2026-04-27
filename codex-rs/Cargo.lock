@@ -3064,6 +3064,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-orchestrator"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "pretty_assertions",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "codex-otel"
 version = "0.0.0"
 dependencies = [

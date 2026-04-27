@@ -49,6 +49,7 @@ members = [
     "minimax",
     "model-provider-info",
     "models-manager",
+    "orchestrator",
     "network-proxy",
     "ollama",
     "process-hardening",
