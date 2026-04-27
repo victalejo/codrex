@@ -305,19 +305,25 @@ fn warn_lossy_tool(spec: &ToolSpec) {
     }
 }
 
-/// Resolve credentials for a configured MiniMax provider. Honors the
-/// provider's `env_key` (when set) before falling back to the standard
-/// `MINIMAX_API_KEY` / `MINIMAX_CODING_PLAN_KEY` resolution.
+/// Resolve credentials for a configured MiniMax provider.
+///
+/// Resolution order (Phase 2.5 — first match wins):
+///   1. The provider's configured `env_key` if set and present in the
+///      environment.
+///   2. The standard `MINIMAX_API_KEY` / `MINIMAX_CODING_PLAN_KEY` env
+///      vars (Coding Plan preferred when both are set).
+///   3. `auth.json::providers["minimax"]` resolved via the configured
+///      auth credential store (Auto/File/Keyring/Ephemeral). Reads
+///      whichever backend the user has configured for OpenAI auth.
+///   4. A clear error pointing the user at `codrex login minimax`.
 fn resolve_credentials(provider: &ModelProviderInfo) -> Result<ResolvedAuth, CodexErr> {
+    // 1. Provider-specific env var override (set in the provider config).
     if let Some(env_key) = provider.env_key.as_deref()
         && let Ok(value) = std::env::var(env_key)
         && !value.trim().is_empty()
     {
         return Ok(ResolvedAuth {
             bearer_token: value,
-            // We can't return a `&'static str` for an arbitrary user key,
-            // but the diagnostic field accepts a fixed pool of names. Map
-            // the standard cases and fall back to the generic placeholder.
             env_var: match env_key {
                 "MINIMAX_API_KEY" => "MINIMAX_API_KEY",
                 "MINIMAX_CODING_PLAN_KEY" => "MINIMAX_CODING_PLAN_KEY",
@@ -325,8 +331,51 @@ fn resolve_credentials(provider: &ModelProviderInfo) -> Result<ResolvedAuth, Cod
             },
         });
     }
-    resolve_auth_from_env(AuthPreference::default()).map_err(|err| {
-        CodexErr::UnsupportedOperation(format!("MiniMax credentials unavailable: {err}"))
+
+    // 2. Standard MiniMax env vars (Coding Plan preferred).
+    if let Ok(auth) = resolve_auth_from_env(AuthPreference::default()) {
+        return Ok(auth);
+    }
+
+    // 3. auth.json fallback. Use the running process's CODREX_HOME and
+    // the Auto store mode so credentials saved via `codrex login minimax`
+    // (which honors the user's configured store backend) are visible
+    // here regardless of where they actually live (file vs keyring).
+    if let Some(auth) = load_minimax_credentials_from_auth_file() {
+        return Ok(auth);
+    }
+
+    // 4. No credentials anywhere. Tell the user what to do, in
+    // explicit priority order.
+    Err(CodexErr::UnsupportedOperation(
+        "no credentials for provider 'minimax'. Run \
+         `codrex login minimax` or set MINIMAX_API_KEY \
+         (pay-as-you-go) / MINIMAX_CODING_PLAN_KEY (Coding Plan)."
+            .to_string(),
+    ))
+}
+
+/// Load MiniMax credentials from `auth.json::providers["minimax"]` if
+/// available. Returns `None` on any failure (missing home dir, missing
+/// or unparseable auth file, no provider entry) so the caller can move
+/// on to the explicit "no credentials" error message.
+fn load_minimax_credentials_from_auth_file() -> Option<ResolvedAuth> {
+    let codex_home = codex_utils_home_dir::find_codex_home().ok()?;
+    let creds = codex_login::load_provider_credentials(
+        codex_home.as_path(),
+        codex_config::types::AuthCredentialsStoreMode::Auto,
+        codex_minimax::MINIMAX_PROVIDER_ID,
+    )
+    .ok()
+    .flatten()?;
+
+    let env_var = match creds.kind.as_deref() {
+        Some("coding_plan") => "MINIMAX_CODING_PLAN_KEY",
+        _ => "MINIMAX_API_KEY",
+    };
+    Some(ResolvedAuth {
+        bearer_token: creds.api_key,
+        env_var,
     })
 }
 
@@ -551,6 +600,123 @@ mod tests {
             .expect("tool-result message present");
         assert_eq!(tool_result.tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(tool_result.content, "17C");
+    }
+
+    // -----------------------------------------------------------------
+    // Credential resolution chain (Phase 2.5 commit 2)
+    // -----------------------------------------------------------------
+    //
+    // These tests serialize on a process-wide mutex because they
+    // mutate env vars + CODREX_HOME. `serial_test::serial` makes that
+    // safe across the whole test binary.
+
+    fn minimax_provider_info() -> codex_model_provider_info::ModelProviderInfo {
+        codex_model_provider_info::ModelProviderInfo::create_minimax_provider()
+    }
+
+    fn clear_minimax_env() {
+        for var in [
+            "MINIMAX_API_KEY",
+            "MINIMAX_CODING_PLAN_KEY",
+            "CODREX_HOME",
+            "CODEX_HOME",
+        ] {
+            // SAFETY: serialized via #[serial] in the call site below.
+            unsafe {
+                std::env::remove_var(var);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_credentials_prefers_env_over_auth_file() -> anyhow::Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        // Seed auth.json with a "file-token" — env should still win.
+        codex_login::save_provider_credentials(
+            codex_home.path(),
+            codex_config::types::AuthCredentialsStoreMode::File,
+            codex_minimax::MINIMAX_PROVIDER_ID,
+            codex_login::ProviderCredentials {
+                api_key: "file-token".into(),
+                kind: Some("standard".into()),
+                last_verified: None,
+            },
+        )?;
+        clear_minimax_env();
+        // SAFETY: serialized.
+        unsafe {
+            std::env::set_var("CODREX_HOME", codex_home.path());
+            std::env::set_var("MINIMAX_API_KEY", "env-token-wins");
+        }
+
+        let auth = resolve_credentials(&minimax_provider_info()).expect("ok");
+        assert_eq!(auth.bearer_token, "env-token-wins");
+        assert_eq!(auth.env_var, "MINIMAX_API_KEY");
+
+        clear_minimax_env();
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_credentials_falls_back_to_auth_file_when_env_empty() -> anyhow::Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        codex_login::save_provider_credentials(
+            codex_home.path(),
+            codex_config::types::AuthCredentialsStoreMode::File,
+            codex_minimax::MINIMAX_PROVIDER_ID,
+            codex_login::ProviderCredentials {
+                api_key: "file-only-token".into(),
+                kind: Some("coding_plan".into()),
+                last_verified: None,
+            },
+        )?;
+        clear_minimax_env();
+        // SAFETY: serialized.
+        unsafe {
+            std::env::set_var("CODREX_HOME", codex_home.path());
+        }
+
+        let auth = resolve_credentials(&minimax_provider_info()).expect("ok");
+        assert_eq!(auth.bearer_token, "file-only-token");
+        // The `kind = "coding_plan"` translates into the diagnostic
+        // env_var label so consumers know which key family was used.
+        assert_eq!(auth.env_var, "MINIMAX_CODING_PLAN_KEY");
+
+        clear_minimax_env();
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_credentials_errors_clearly_when_nothing_configured() -> anyhow::Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        // No env vars, no auth.json populated.
+        clear_minimax_env();
+        // SAFETY: serialized.
+        unsafe {
+            std::env::set_var("CODREX_HOME", codex_home.path());
+        }
+
+        let err = resolve_credentials(&minimax_provider_info())
+            .expect_err("resolve must fail when no credentials anywhere");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no credentials for provider 'minimax'"),
+            "error message must name the provider: {msg}"
+        );
+        assert!(
+            msg.contains("codrex login minimax"),
+            "error message must point at the login command: {msg}"
+        );
+        assert!(
+            msg.contains("MINIMAX_API_KEY"),
+            "error message must mention the env var alternative: {msg}"
+        );
+
+        clear_minimax_env();
+        Ok(())
     }
 
     #[test]
