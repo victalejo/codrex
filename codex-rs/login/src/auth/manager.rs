@@ -26,6 +26,9 @@ use super::revoke::revoke_auth_tokens;
 pub use crate::auth::agent_identity::AgentIdentityAuth;
 pub use crate::auth::storage::AgentIdentityAuthRecord;
 pub use crate::auth::storage::AuthDotJson;
+pub use crate::auth::storage::AuthFile;
+pub use crate::auth::storage::AuthSource;
+pub use crate::auth::storage::ProviderCredentials;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::create_auth_storage;
 use crate::auth::util::try_parse_error_message;
@@ -578,14 +581,24 @@ pub fn login_with_chatgpt_auth_tokens(
     )
 }
 
-/// Persist the provided auth payload using the specified backend.
+/// Persist the OpenAI-shaped auth payload using the specified backend,
+/// preserving any provider credentials already stored under `providers`.
+///
+/// If reading the existing auth file fails (corruption, unsupported old
+/// version, etc.), this falls back to a clean overwrite so a corrupted
+/// `auth.json` never blocks a fresh login.
 pub fn save_auth(
     codex_home: &Path,
     auth: &AuthDotJson,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<()> {
     let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
-    storage.save(auth)
+    let mut file = match storage.load_file() {
+        Ok(Some(file)) => file,
+        Ok(None) | Err(_) => crate::auth::storage::AuthFile::default(),
+    };
+    file.openai = auth.clone();
+    storage.save_file(&file)
 }
 
 /// Load CLI auth data using the configured credential store backend.
@@ -599,6 +612,97 @@ pub fn load_auth_dot_json(
 ) -> std::io::Result<Option<AuthDotJson>> {
     let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
     storage.load()
+}
+
+// ---------------------------------------------------------------------------
+// Codrex Phase 2.5: multi-provider credential APIs
+// ---------------------------------------------------------------------------
+//
+// These functions live alongside the OpenAI-shaped `save_auth` /
+// `load_auth_dot_json` APIs but operate on the per-provider map carried by
+// `AuthFile.providers`. They preserve the OpenAI subset of `auth.json`
+// across writes — adding a MiniMax credential never wipes ChatGPT tokens
+// and removing it never touches OpenAI fields.
+
+/// Persist credentials for an arbitrary provider id (e.g. `"minimax"`).
+/// The OpenAI-shaped portion of `auth.json` is preserved verbatim.
+pub fn save_provider_credentials(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    provider_id: &str,
+    credentials: ProviderCredentials,
+) -> std::io::Result<()> {
+    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    let mut auth = storage.load_file()?.unwrap_or_default();
+    auth.providers
+        .insert(provider_id.to_string(), credentials);
+    storage.save_file(&auth)
+}
+
+/// Load credentials for a single provider id, or `None` if not configured.
+pub fn load_provider_credentials(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    provider_id: &str,
+) -> std::io::Result<Option<ProviderCredentials>> {
+    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    Ok(storage
+        .load_file()?
+        .and_then(|file| file.providers.get(provider_id).cloned()))
+}
+
+/// Remove credentials for a single provider id. Returns `true` if a
+/// credential existed and was removed, `false` if there was nothing to
+/// remove. The OpenAI-shaped subset of `auth.json` is preserved.
+///
+/// If removing the credential leaves `auth.json` totally empty (no
+/// OpenAI auth + no other providers), the storage entry is deleted
+/// outright rather than written back as an empty stub.
+pub fn remove_provider_credentials(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    provider_id: &str,
+) -> std::io::Result<bool> {
+    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    let Some(mut auth) = storage.load_file()? else {
+        return Ok(false);
+    };
+    if auth.providers.remove(provider_id).is_none() {
+        return Ok(false);
+    }
+    if auth.is_empty() {
+        storage.delete()?;
+    } else {
+        storage.save_file(&auth)?;
+    }
+    Ok(true)
+}
+
+/// Snapshot of every provider credential the auth.json knows about,
+/// returned in deterministic order (sorted by provider id) for stable
+/// CLI output.
+pub fn list_provider_credentials(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<Vec<(String, ProviderCredentials)>> {
+    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    let Some(auth) = storage.load_file()? else {
+        return Ok(Vec::new());
+    };
+    let mut entries: Vec<(String, ProviderCredentials)> = auth
+        .providers
+        .into_iter()
+        .map(|(id, creds)| (id, creds))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
+/// Returns where credentials are physically stored for the active backend
+/// (`File`, `Keyring`, or `Ephemeral`). Used by `codrex login --list` to
+/// label the source column.
+pub fn auth_source(auth_credentials_store_mode: AuthCredentialsStoreMode) -> AuthSource {
+    create_auth_storage(PathBuf::from("/tmp"), auth_credentials_store_mode).source()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

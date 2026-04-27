@@ -487,3 +487,327 @@ fn auto_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ===========================================================================
+// Codrex Phase 2.5: multi-provider schema tests
+// ===========================================================================
+
+#[test]
+fn legacy_openai_only_auth_json_deserializes_into_auth_file() {
+    // A file written by upstream Codex (no `providers` key) must still
+    // load cleanly into the new `AuthFile` shape.
+    let raw = r#"{
+        "OPENAI_API_KEY": "sk-legacy",
+        "auth_mode": "apikey"
+    }"#;
+    let parsed: AuthFile = serde_json::from_str(raw).expect("legacy auth.json parses");
+    assert_eq!(parsed.openai.openai_api_key.as_deref(), Some("sk-legacy"));
+    assert_eq!(parsed.openai.auth_mode, Some(AuthMode::ApiKey));
+    assert!(parsed.providers.is_empty());
+}
+
+#[test]
+fn auth_file_serialization_omits_empty_providers() {
+    // A file with no providers must not include the `providers` key on
+    // disk so we never write empty `{}` stubs.
+    let auth = AuthFile {
+        openai: AuthDotJson {
+            auth_mode: Some(AuthMode::ApiKey),
+            openai_api_key: Some("sk-legacy".to_string()),
+            tokens: None,
+            last_refresh: None,
+            agent_identity: None,
+        },
+        providers: HashMap::new(),
+    };
+    let json = serde_json::to_value(&auth).expect("serialize");
+    assert_eq!(json["OPENAI_API_KEY"], serde_json::json!("sk-legacy"));
+    assert!(
+        json.get("providers").is_none(),
+        "empty providers map must not appear on disk"
+    );
+}
+
+#[test]
+fn auth_file_with_providers_serializes_at_top_level() {
+    let mut providers: HashMap<String, ProviderCredentials> = HashMap::new();
+    providers.insert(
+        "minimax".to_string(),
+        ProviderCredentials {
+            api_key: "sk-cp-secret".to_string(),
+            kind: Some("coding_plan".to_string()),
+            last_verified: None,
+        },
+    );
+    let auth = AuthFile {
+        openai: AuthDotJson::default(),
+        providers,
+    };
+    let json = serde_json::to_value(&auth).expect("serialize");
+    // OpenAI-shaped fields are flattened at the top level.
+    assert_eq!(json["OPENAI_API_KEY"], serde_json::Value::Null);
+    // Providers map lives at top-level under `providers`.
+    assert_eq!(json["providers"]["minimax"]["api_key"], serde_json::json!("sk-cp-secret"));
+    assert_eq!(json["providers"]["minimax"]["kind"], serde_json::json!("coding_plan"));
+    assert!(json["providers"]["minimax"].get("last_verified").is_none());
+}
+
+#[test]
+fn auth_file_roundtrip_preserves_both_openai_and_providers() {
+    let mut providers: HashMap<String, ProviderCredentials> = HashMap::new();
+    providers.insert(
+        "minimax".to_string(),
+        ProviderCredentials {
+            api_key: "sk-cp-1".to_string(),
+            kind: Some("coding_plan".to_string()),
+            last_verified: None,
+        },
+    );
+    providers.insert(
+        "qwen".to_string(),
+        ProviderCredentials {
+            api_key: "sk-q-2".to_string(),
+            kind: None,
+            last_verified: None,
+        },
+    );
+    let original = AuthFile {
+        openai: AuthDotJson {
+            auth_mode: Some(AuthMode::ApiKey),
+            openai_api_key: Some("sk-openai".to_string()),
+            tokens: None,
+            last_refresh: None,
+            agent_identity: None,
+        },
+        providers,
+    };
+    let json = serde_json::to_string(&original).expect("serialize");
+    let roundtripped: AuthFile = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(roundtripped, original);
+}
+
+#[test]
+fn auth_file_with_only_providers_loads_without_openai() {
+    // Provider-only auth.json (no OpenAI auth) must deserialize cleanly.
+    let raw = r#"{
+        "providers": {
+            "minimax": {
+                "api_key": "sk-cp-only",
+                "kind": "coding_plan"
+            }
+        }
+    }"#;
+    let parsed: AuthFile = serde_json::from_str(raw).expect("parses");
+    assert_eq!(parsed.openai, AuthDotJson::default());
+    assert_eq!(parsed.providers.len(), 1);
+    assert_eq!(
+        parsed.providers["minimax"].api_key,
+        "sk-cp-only".to_string()
+    );
+}
+
+#[test]
+fn auth_file_is_empty_helper_distinguishes_meaningful_state() {
+    let empty = AuthFile::default();
+    assert!(empty.is_empty());
+
+    let with_openai = AuthFile {
+        openai: AuthDotJson {
+            openai_api_key: Some("sk-x".into()),
+            ..AuthDotJson::default()
+        },
+        providers: HashMap::new(),
+    };
+    assert!(!with_openai.is_empty());
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        "minimax".to_string(),
+        ProviderCredentials {
+            api_key: "sk-y".into(),
+            kind: None,
+            last_verified: None,
+        },
+    );
+    let with_provider = AuthFile {
+        openai: AuthDotJson::default(),
+        providers,
+    };
+    assert!(!with_provider.is_empty());
+}
+
+#[test]
+fn save_auth_preserves_providers_across_openai_writes() -> anyhow::Result<()> {
+    use crate::auth::manager::save_auth;
+    use crate::auth::manager::save_provider_credentials;
+    use crate::auth::manager::load_provider_credentials;
+
+    let codex_home = tempdir()?;
+    let mode = AuthCredentialsStoreMode::File;
+
+    // Step 1: store a MiniMax credential.
+    save_provider_credentials(
+        codex_home.path(),
+        mode,
+        "minimax",
+        ProviderCredentials {
+            api_key: "sk-cp-keep".to_string(),
+            kind: Some("coding_plan".to_string()),
+            last_verified: None,
+        },
+    )?;
+
+    // Step 2: do an OpenAI-only login. Providers MUST survive.
+    let openai = AuthDotJson {
+        auth_mode: Some(AuthMode::ApiKey),
+        openai_api_key: Some("sk-openai-after".to_string()),
+        tokens: None,
+        last_refresh: None,
+        agent_identity: None,
+    };
+    save_auth(codex_home.path(), &openai, mode)?;
+
+    // Step 3: verify both halves still readable.
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let loaded = storage.load_file()?.expect("auth file exists");
+    assert_eq!(loaded.openai.openai_api_key.as_deref(), Some("sk-openai-after"));
+    let minimax = load_provider_credentials(codex_home.path(), mode, "minimax")?
+        .expect("minimax credential preserved across openai login");
+    assert_eq!(minimax.api_key, "sk-cp-keep");
+    assert_eq!(minimax.kind.as_deref(), Some("coding_plan"));
+    Ok(())
+}
+
+#[test]
+fn provider_credentials_remove_deletes_file_when_last_credential_gone() -> anyhow::Result<()> {
+    use crate::auth::manager::remove_provider_credentials;
+    use crate::auth::manager::save_provider_credentials;
+
+    let codex_home = tempdir()?;
+    let mode = AuthCredentialsStoreMode::File;
+    save_provider_credentials(
+        codex_home.path(),
+        mode,
+        "minimax",
+        ProviderCredentials {
+            api_key: "sk-cp".into(),
+            kind: None,
+            last_verified: None,
+        },
+    )?;
+    assert!(get_auth_file(codex_home.path()).exists());
+
+    let removed = remove_provider_credentials(codex_home.path(), mode, "minimax")?;
+    assert!(removed, "remove_provider_credentials should report success");
+    assert!(
+        !get_auth_file(codex_home.path()).exists(),
+        "auth.json should be deleted when no credentials remain"
+    );
+    Ok(())
+}
+
+#[test]
+fn provider_credentials_remove_keeps_file_when_openai_present() -> anyhow::Result<()> {
+    use crate::auth::manager::remove_provider_credentials;
+    use crate::auth::manager::save_auth;
+    use crate::auth::manager::save_provider_credentials;
+
+    let codex_home = tempdir()?;
+    let mode = AuthCredentialsStoreMode::File;
+    save_auth(
+        codex_home.path(),
+        &AuthDotJson {
+            auth_mode: Some(AuthMode::ApiKey),
+            openai_api_key: Some("sk-openai".into()),
+            tokens: None,
+            last_refresh: None,
+            agent_identity: None,
+        },
+        mode,
+    )?;
+    save_provider_credentials(
+        codex_home.path(),
+        mode,
+        "minimax",
+        ProviderCredentials {
+            api_key: "sk-cp".into(),
+            kind: None,
+            last_verified: None,
+        },
+    )?;
+
+    let removed = remove_provider_credentials(codex_home.path(), mode, "minimax")?;
+    assert!(removed);
+    assert!(
+        get_auth_file(codex_home.path()).exists(),
+        "auth.json must survive when OpenAI is still configured"
+    );
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let loaded = storage.load_file()?.expect("auth still present");
+    assert_eq!(loaded.openai.openai_api_key.as_deref(), Some("sk-openai"));
+    assert!(loaded.providers.is_empty());
+    Ok(())
+}
+
+#[test]
+fn provider_credentials_remove_returns_false_when_absent() -> anyhow::Result<()> {
+    use crate::auth::manager::remove_provider_credentials;
+    let codex_home = tempdir()?;
+    let removed = remove_provider_credentials(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        "minimax",
+    )?;
+    assert!(!removed);
+    Ok(())
+}
+
+#[test]
+fn list_provider_credentials_returns_sorted_entries() -> anyhow::Result<()> {
+    use crate::auth::manager::list_provider_credentials;
+    use crate::auth::manager::save_provider_credentials;
+    let codex_home = tempdir()?;
+    let mode = AuthCredentialsStoreMode::File;
+    for id in ["qwen", "minimax", "deepseek"] {
+        save_provider_credentials(
+            codex_home.path(),
+            mode,
+            id,
+            ProviderCredentials {
+                api_key: format!("sk-{id}"),
+                kind: None,
+                last_verified: None,
+            },
+        )?;
+    }
+    let listed = list_provider_credentials(codex_home.path(), mode)?;
+    let ids: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, vec!["deepseek", "minimax", "qwen"]);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_credentials_file_is_chmod_0600() -> anyhow::Result<()> {
+    use crate::auth::manager::save_provider_credentials;
+    use std::os::unix::fs::PermissionsExt;
+    let codex_home = tempdir()?;
+    save_provider_credentials(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        "minimax",
+        ProviderCredentials {
+            api_key: "sk-cp".into(),
+            kind: None,
+            last_verified: None,
+        },
+    )?;
+    let auth_file = get_auth_file(codex_home.path());
+    let perms = std::fs::metadata(&auth_file)?.permissions();
+    let mode = perms.mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "auth.json must be chmod 0600 after provider credential write"
+    );
+    Ok(())
+}
