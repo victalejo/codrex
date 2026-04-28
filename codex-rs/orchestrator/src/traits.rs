@@ -175,7 +175,8 @@ pub enum LogStage {
     DispatchEnd,
     /// One row per acceptance criterion the auditor evaluated. Emitted
     /// BEFORE the aggregated `Audit` row. Greppable as
-    /// `"stage":"audit_criterion"` for per-criterion dashboards.
+    /// `"stage":"audit.criterion"` for per-criterion dashboards.
+    #[serde(rename = "audit.criterion")]
     AuditCriterion,
     Audit,
     Decision,
@@ -191,6 +192,13 @@ mod tests {
     fn log_stage_serde_uses_snake_case() {
         let s = serde_json::to_string(&LogStage::DispatchStart).unwrap();
         assert_eq!(s, r#""dispatch_start""#);
+    }
+
+    #[test]
+    fn log_stage_audit_criterion_uses_dotted_name() {
+        let json = serde_json::to_string(&LogStage::AuditCriterion).unwrap();
+        assert_eq!(json, r#""audit.criterion""#);
+        assert!(!json.contains("audit_criterion"));
     }
 
     #[test]
