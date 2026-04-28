@@ -33,8 +33,8 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use regex::Regex;
-use serde::Deserializer;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
 use uuid::Uuid;
@@ -411,10 +411,7 @@ mod tests {
         let mut spec = sample_spec();
         spec.expected_tests = None;
         let err = spec.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            SpecError::TestsPassWithoutExpectedTests(_)
-        ));
+        assert!(matches!(err, SpecError::TestsPassWithoutExpectedTests(_)));
     }
 
     #[test]
@@ -475,8 +472,8 @@ mod tests {
         let json = serde_json::to_string(&AcceptanceCriterion::TestsPass).unwrap();
         assert_eq!(json, r#"{"kind":"tests_pass"}"#);
 
-        let json = serde_json::to_string(&AcceptanceCriterion::output_matches("x").unwrap())
-            .unwrap();
+        let json =
+            serde_json::to_string(&AcceptanceCriterion::output_matches("x").unwrap()).unwrap();
         assert_eq!(json, r#"{"kind":"output_matches","regex":"x"}"#);
     }
 }

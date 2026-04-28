@@ -141,8 +141,7 @@ fn render_system_message(spec: &DelegationSpec) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "You are MiniMax, executing a delegated task as part of the Codrex orchestrator (run_id={})."
-,
+        "You are MiniMax, executing a delegated task as part of the Codrex orchestrator (run_id={}).",
         spec.run_id
     );
     let _ = writeln!(s, "Respond with a complete answer to the intent below.");
@@ -192,8 +191,16 @@ impl DispatchSink for MinimaxDispatchSink {
                 "[codrex/orch] dispatch run_id={} model={} (system_len={} user_len={})",
                 ctx.run_id,
                 self.model,
-                request.messages.first().map(|m| m.content.len()).unwrap_or(0),
-                request.messages.last().map(|m| m.content.len()).unwrap_or(0),
+                request
+                    .messages
+                    .first()
+                    .map(|m| m.content.len())
+                    .unwrap_or(0),
+                request
+                    .messages
+                    .last()
+                    .map(|m| m.content.len())
+                    .unwrap_or(0),
             );
         }
 
@@ -379,7 +386,10 @@ mod tests {
 
         let sink = MinimaxDispatchSink::new("MiniMax-M2.7");
         let spec = spec_with_intent("ping");
-        let outcome = sink.dispatch(&spec, &ctx(&spec)).await.expect("dispatch ok");
+        let outcome = sink
+            .dispatch(&spec, &ctx(&spec))
+            .await
+            .expect("dispatch ok");
         assert_eq!(outcome.response_text, "Hello, world.");
         assert_eq!(outcome.total_tokens, Some(8));
         assert!(outcome.latency_ms < 30_000);
@@ -447,7 +457,9 @@ mod tests {
                 .dispatch(&spec, &ctx(&spec))
                 .await
                 .expect_err("expected transport error");
-            assert!(matches!(err, DispatchError::Transport(msg) if msg.contains("codrex login minimax")));
+            assert!(
+                matches!(err, DispatchError::Transport(msg) if msg.contains("codrex login minimax"))
+            );
             std::env::remove_var("CODREX_HOME");
             drop(tmp);
         }

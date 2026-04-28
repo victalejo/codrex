@@ -111,10 +111,7 @@ impl JsonlDecisionLog {
             }
         }
         let path = self.current_path();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         // Build the full payload (line + LF) in memory and emit it in
         // ONE `write_all` so concurrent appenders see line-granular
         // interleaving without partial-line corruption. POSIX
@@ -145,12 +142,7 @@ struct LogRow<'a> {
 
 #[async_trait]
 impl DecisionLog for JsonlDecisionLog {
-    async fn record(
-        &self,
-        ctx: &DelegationContext,
-        stage: LogStage,
-        payload: serde_json::Value,
-    ) {
+    async fn record(&self, ctx: &DelegationContext, stage: LogStage, payload: serde_json::Value) {
         let payload_serialized =
             serde_json::to_string(&payload).unwrap_or_else(|_| "null".to_string());
         let payload_owned;
@@ -228,12 +220,7 @@ impl InMemoryDecisionLog {
 
 #[async_trait]
 impl DecisionLog for InMemoryDecisionLog {
-    async fn record(
-        &self,
-        ctx: &DelegationContext,
-        stage: LogStage,
-        payload: serde_json::Value,
-    ) {
+    async fn record(&self, ctx: &DelegationContext, stage: LogStage, payload: serde_json::Value) {
         self.events.lock().expect("poisoned").push(RecordedEvent {
             run_id: ctx.run_id,
             parent_run_id: ctx.parent_run_id,

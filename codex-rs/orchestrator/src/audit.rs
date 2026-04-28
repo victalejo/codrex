@@ -166,7 +166,11 @@ impl Auditor for PatternAuditor {
                     let details = result.details.clone();
                     criterion_results.push(result);
                     if !passed {
-                        return early_escalate(criterion_results, &details, "no_forbidden_patterns");
+                        return early_escalate(
+                            criterion_results,
+                            &details,
+                            "no_forbidden_patterns",
+                        );
                     }
                 }
                 AcceptanceCriterion::OutputMatches { regex } => {
@@ -175,12 +179,7 @@ impl Auditor for PatternAuditor {
                     let details = result.details.clone();
                     criterion_results.push(result);
                     if !passed {
-                        return early_retry(
-                            criterion_results,
-                            ctx,
-                            "output_matches",
-                            &details,
-                        );
+                        return early_retry(criterion_results, ctx, "output_matches", &details);
                     }
                 }
                 AcceptanceCriterion::TestsPass => {
@@ -206,17 +205,11 @@ impl Auditor for PatternAuditor {
                     let details = result.details.clone();
                     criterion_results.push(result);
                     if !passed {
-                        return early_retry(
-                            criterion_results,
-                            ctx,
-                            "tests_pass",
-                            &details,
-                        );
+                        return early_retry(criterion_results, ctx, "tests_pass", &details);
                     }
                 }
                 AcceptanceCriterion::Custom { name, check } => {
-                    let result =
-                        run_custom_script(idx, name, check, self.process_timeout).await;
+                    let result = run_custom_script(idx, name, check, self.process_timeout).await;
                     let passed = result.passed;
                     let details = result.details.clone();
                     criterion_results.push(result);
@@ -238,10 +231,7 @@ impl Auditor for PatternAuditor {
                 rationale: if criterion_results.is_empty() {
                     "no acceptance criteria configured; treating as pass-through Ok".to_string()
                 } else {
-                    format!(
-                        "all {} acceptance criteria passed",
-                        criterion_results.len()
-                    )
+                    format!("all {} acceptance criteria passed", criterion_results.len())
                 },
             },
             criterion_results,
@@ -318,11 +308,11 @@ fn format_retry_feedback(label: &str, details: &JsonValue) -> String {
             )
         }
         "tests_pass" => {
-            let exit = details.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(-1);
-            let stderr = details
-                .get("stderr")
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
+            let exit = details
+                .get("exit_code")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(-1);
+            let stderr = details.get("stderr").and_then(|x| x.as_str()).unwrap_or("");
             let snippet = stderr.chars().take(2048).collect::<String>();
             format!(
                 "Tests failed (exit code {exit}). Stderr snippet:\n{snippet}\n\
@@ -330,15 +320,13 @@ fn format_retry_feedback(label: &str, details: &JsonValue) -> String {
             )
         }
         s if s.starts_with("custom:") => {
-            let exit = details.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(-1);
-            let stderr = details
-                .get("stderr")
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
+            let exit = details
+                .get("exit_code")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(-1);
+            let stderr = details.get("stderr").and_then(|x| x.as_str()).unwrap_or("");
             let snippet = stderr.chars().take(2048).collect::<String>();
-            format!(
-                "Custom acceptance check `{s}` failed (exit {exit}). Stderr:\n{snippet}"
-            )
+            format!("Custom acceptance check `{s}` failed (exit {exit}). Stderr:\n{snippet}")
         }
         _ => format!("{label} failed: {details}"),
     }
@@ -387,9 +375,7 @@ fn check_output_matches(
     let matched = regex.regex().is_match(&outcome.response_text);
     let duration_ms = started.elapsed().as_millis() as u64;
     if orch_debug_enabled() {
-        eprintln!(
-            "[codrex/orch] audit output_matches[{idx}] passed={matched} ({duration_ms}ms)"
-        );
+        eprintln!("[codrex/orch] audit output_matches[{idx}] passed={matched} ({duration_ms}ms)");
     }
     CriterionResult {
         name: format!("output_matches[{idx}]"),

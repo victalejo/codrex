@@ -108,12 +108,7 @@ mod tests {
             }
             .is_terminal()
         );
-        assert!(
-            AuditDecision::Drop {
-                reason: "x".into()
-            }
-            .is_terminal()
-        );
+        assert!(AuditDecision::Drop { reason: "x".into() }.is_terminal());
         assert!(
             !AuditDecision::Retry {
                 feedback: "x".into(),

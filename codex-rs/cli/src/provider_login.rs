@@ -135,20 +135,30 @@ pub async fn run_login_provider(
         );
     }
 
-    let kind = if coding_plan { "coding_plan" } else { "standard" };
+    let kind = if coding_plan {
+        "coding_plan"
+    } else {
+        "standard"
+    };
     let credentials = ProviderCredentials {
         api_key: api_key.clone(),
         kind: Some(kind.to_string()),
         last_verified: None,
     };
 
-    if let Err(err) =
-        save_provider_credentials(&config.codex_home, store_mode, provider.id, credentials.clone())
-    {
+    if let Err(err) = save_provider_credentials(
+        &config.codex_home,
+        store_mode,
+        provider.id,
+        credentials.clone(),
+    ) {
         eprintln!("Error saving credentials for '{}': {err}", provider.id);
         std::process::exit(1);
     }
-    eprintln!("✓ Saved credentials for provider '{}' ({kind})", provider.id);
+    eprintln!(
+        "✓ Saved credentials for provider '{}' ({kind})",
+        provider.id
+    );
 
     if cfg!(unix) {
         report_unix_permissions(&config.codex_home);
@@ -175,12 +185,8 @@ pub async fn run_login_provider(
                 // Persist `last_verified` so `--list` can surface it.
                 let mut updated = credentials;
                 updated.last_verified = Some(chrono::Utc::now());
-                let _ = save_provider_credentials(
-                    &config.codex_home,
-                    store_mode,
-                    provider.id,
-                    updated,
-                );
+                let _ =
+                    save_provider_credentials(&config.codex_home, store_mode, provider.id, updated);
             }
             Err(err) => {
                 eprintln!(
@@ -220,10 +226,16 @@ pub async fn run_provider_logout(
 
     match remove_provider_credentials(&config.codex_home, store_mode, provider.id) {
         Ok(true) => {
-            eprintln!("✓ Removed credentials for '{}' from local storage.", provider.id);
+            eprintln!(
+                "✓ Removed credentials for '{}' from local storage.",
+                provider.id
+            );
         }
         Ok(false) => {
-            eprintln!("No saved credentials for '{}' (nothing to remove).", provider.id);
+            eprintln!(
+                "No saved credentials for '{}' (nothing to remove).",
+                provider.id
+            );
         }
         Err(err) => {
             eprintln!("Error removing credentials for '{}': {err}", provider.id);
@@ -263,7 +275,10 @@ pub async fn run_login_list(cli_config_overrides: CliConfigOverrides) -> ! {
 
     // OpenAI subset, if present in the auth file.
     if let Ok(Some(openai)) = codex_login::load_auth_dot_json(&config.codex_home, store_mode) {
-        if openai.openai_api_key.is_some() || openai.tokens.is_some() || openai.agent_identity.is_some() {
+        if openai.openai_api_key.is_some()
+            || openai.tokens.is_some()
+            || openai.agent_identity.is_some()
+        {
             let kind = if openai.tokens.is_some() {
                 "chatgpt"
             } else if openai.agent_identity.is_some() {
@@ -275,7 +290,9 @@ pub async fn run_login_list(cli_config_overrides: CliConfigOverrides) -> ! {
                 provider: "openai".to_string(),
                 kind: kind.to_string(),
                 source: auth_source(store_mode).display_label(&config.codex_home),
-                last_verified: openai.last_refresh.map(|d| d.format("%Y-%m-%d").to_string()),
+                last_verified: openai
+                    .last_refresh
+                    .map(|d| d.format("%Y-%m-%d").to_string()),
             });
         }
     }
@@ -339,8 +356,14 @@ pub async fn run_login_list(cli_config_overrides: CliConfigOverrides) -> ! {
         let mut stdout = std::io::stdout();
         let _ = writeln!(stdout, "No credentials configured.\n");
         let _ = writeln!(stdout, "To get started:");
-        let _ = writeln!(stdout, "  codrex login                    # OpenAI (interactive OAuth)");
-        let _ = writeln!(stdout, "  codrex login minimax            # MiniMax (paste API key)");
+        let _ = writeln!(
+            stdout,
+            "  codrex login                    # OpenAI (interactive OAuth)"
+        );
+        let _ = writeln!(
+            stdout,
+            "  codrex login minimax            # MiniMax (paste API key)"
+        );
         std::process::exit(0);
     }
 
@@ -399,9 +422,7 @@ fn print_list_rows(rows: &[ListRow]) {
 }
 
 fn prompt_hidden_api_key(provider_display_name: &str) -> String {
-    let prompt = format!(
-        "Paste your {provider_display_name} API key (input hidden): "
-    );
+    let prompt = format!("Paste your {provider_display_name} API key (input hidden): ");
     match rpassword::prompt_password(prompt) {
         Ok(value) => value,
         Err(err) => {
@@ -439,8 +460,9 @@ fn report_unix_permissions(codex_home: &std::path::Path) {
             } else {
                 eprintln!(
                     "⚠ auth.json permissions are {mode:o} (expected 0600). \
-                     Run `chmod 0600 {}` to tighten."
-                , auth.display());
+                     Run `chmod 0600 {}` to tighten.",
+                    auth.display()
+                );
             }
         }
     }
