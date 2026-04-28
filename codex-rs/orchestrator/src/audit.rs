@@ -57,6 +57,10 @@ use tracing::warn;
 
 use crate::context::DelegationContext;
 use crate::decision::AuditDecision;
+use crate::decision::CriterionKind;
+use crate::decision::FailedCriterion;
+use crate::decision::FailureDetails;
+use crate::decision::RetryFeedback;
 use crate::orch_debug_enabled;
 use crate::spec::AcceptanceCriterion;
 use crate::spec::DelegationSpec;
@@ -179,7 +183,11 @@ impl Auditor for PatternAuditor {
                     let details = result.details.clone();
                     criterion_results.push(result);
                     if !passed {
-                        return early_retry(criterion_results, ctx, "output_matches", &details);
+                        return early_retry(
+                            criterion_results,
+                            &failed_output_match(idx, regex, details),
+                            ctx,
+                        );
                     }
                 }
                 AcceptanceCriterion::TestsPass => {
@@ -205,7 +213,11 @@ impl Auditor for PatternAuditor {
                     let details = result.details.clone();
                     criterion_results.push(result);
                     if !passed {
-                        return early_retry(criterion_results, ctx, "tests_pass", &details);
+                        return early_retry(
+                            criterion_results,
+                            &failed_tests_pass(test_spec, &details),
+                            ctx,
+                        );
                     }
                 }
                 AcceptanceCriterion::Custom { name, check } => {
@@ -216,9 +228,8 @@ impl Auditor for PatternAuditor {
                     if !passed {
                         return early_retry(
                             criterion_results,
+                            &failed_custom(idx, name, &details),
                             ctx,
-                            &format!("custom:{name}"),
-                            &details,
                         );
                     }
                 }
@@ -256,15 +267,16 @@ fn early_escalate(
 
 fn early_retry(
     criterion_results: Vec<CriterionResult>,
+    failed: &FailedCriterion,
     ctx: &DelegationContext,
-    label: &str,
-    details: &JsonValue,
 ) -> AuditReport {
     // Attempt counter for the NEXT dispatch is +1 of the current ctx
     // attempt. The retry loop in commit 5 will increment ctx before
     // re-dispatching; we record the value the loop should land on.
     let next_attempt = ctx.attempt.saturating_add(1);
-    let feedback = format_retry_feedback(label, details);
+    let feedback = RetryFeedback {
+        failed_criteria: vec![failed.clone()],
+    };
     AuditReport {
         decision: AuditDecision::Retry {
             feedback,
@@ -295,40 +307,90 @@ fn format_blocking_issue(label: &str, details: &JsonValue) -> String {
     format!("{label} failed: {details}")
 }
 
-fn format_retry_feedback(label: &str, details: &JsonValue) -> String {
-    match label {
-        "output_matches" => {
-            let regex = details
-                .get("regex")
+fn failed_output_match(
+    idx: usize,
+    regex: &crate::spec::ValidatedRegex,
+    details: JsonValue,
+) -> FailedCriterion {
+    FailedCriterion {
+        name: format!("output_matches[{idx}]"),
+        kind: CriterionKind::OutputMatches,
+        details: FailureDetails::OutputMatches {
+            regex: regex.as_str().to_string(),
+            output_excerpt: details
+                .get("output_excerpt")
                 .and_then(|x| x.as_str())
-                .unwrap_or("<unknown>");
-            format!(
-                "Your previous response did not match the expected pattern: `{regex}`. \
-                 Please retry and ensure the response matches."
-            )
-        }
-        "tests_pass" => {
-            let exit = details
-                .get("exit_code")
-                .and_then(|x| x.as_i64())
-                .unwrap_or(-1);
-            let stderr = details.get("stderr").and_then(|x| x.as_str()).unwrap_or("");
-            let snippet = stderr.chars().take(2048).collect::<String>();
-            format!(
-                "Tests failed (exit code {exit}). Stderr snippet:\n{snippet}\n\
-                 Please address the failure and retry."
-            )
-        }
-        s if s.starts_with("custom:") => {
-            let exit = details
-                .get("exit_code")
-                .and_then(|x| x.as_i64())
-                .unwrap_or(-1);
-            let stderr = details.get("stderr").and_then(|x| x.as_str()).unwrap_or("");
-            let snippet = stderr.chars().take(2048).collect::<String>();
-            format!("Custom acceptance check `{s}` failed (exit {exit}). Stderr:\n{snippet}")
-        }
-        _ => format!("{label} failed: {details}"),
+                .unwrap_or("")
+                .to_string(),
+        },
+    }
+}
+
+fn failed_tests_pass(test_spec: &TestSpec, details: &JsonValue) -> FailedCriterion {
+    FailedCriterion {
+        name: "tests_pass".to_string(),
+        kind: CriterionKind::TestsPass,
+        details: FailureDetails::TestsPass {
+            exit_code: to_i32(details.get("exit_code").and_then(|x| x.as_i64())),
+            stderr_excerpt: details
+                .get("stderr")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(2048)
+                .collect(),
+            command: test_spec.command.clone(),
+        },
+    }
+}
+
+fn failed_custom(idx: usize, name: &str, details: &JsonValue) -> FailedCriterion {
+    FailedCriterion {
+        name: format!("custom[{idx}:{name}]"),
+        kind: CriterionKind::Custom,
+        details: FailureDetails::Custom {
+            exit_code: to_i32(details.get("exit_code").and_then(|x| x.as_i64())),
+            stderr_excerpt: details
+                .get("stderr")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(2048)
+                .collect(),
+        },
+    }
+}
+
+fn to_i32(value: Option<i64>) -> i32 {
+    value
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(-1)
+}
+
+fn truncated_text(text: &str) -> String {
+    text.chars().take(2048).collect()
+}
+
+fn check_output_matches(
+    idx: usize,
+    regex: &crate::spec::ValidatedRegex,
+    outcome: &DispatchOutcome,
+) -> CriterionResult {
+    let started = Instant::now();
+    let matched = regex.regex().is_match(&outcome.response_text);
+    let duration_ms = started.elapsed().as_millis() as u64;
+    if orch_debug_enabled() {
+        eprintln!("[codrex/orch] audit output_matches[{idx}] passed={matched} ({duration_ms}ms)");
+    }
+    CriterionResult {
+        name: format!("output_matches[{idx}]"),
+        passed: matched,
+        duration_ms,
+        details: json!({
+            "regex": regex.as_str(),
+            "matched": matched,
+            "output_excerpt": truncated_text(&outcome.response_text),
+        }),
     }
 }
 
@@ -363,25 +425,6 @@ fn check_no_forbidden_patterns(
         passed,
         duration_ms,
         details: json!({"matches": matches}),
-    }
-}
-
-fn check_output_matches(
-    idx: usize,
-    regex: &crate::spec::ValidatedRegex,
-    outcome: &DispatchOutcome,
-) -> CriterionResult {
-    let started = Instant::now();
-    let matched = regex.regex().is_match(&outcome.response_text);
-    let duration_ms = started.elapsed().as_millis() as u64;
-    if orch_debug_enabled() {
-        eprintln!("[codrex/orch] audit output_matches[{idx}] passed={matched} ({duration_ms}ms)");
-    }
-    CriterionResult {
-        name: format!("output_matches[{idx}]"),
-        passed: matched,
-        duration_ms,
-        details: json!({"regex": regex.as_str(), "matched": matched}),
     }
 }
 
@@ -624,7 +667,13 @@ mod tests {
         match &report.decision {
             AuditDecision::Retry { feedback, attempt } => {
                 assert_eq!(*attempt, 1);
-                assert!(feedback.contains("DONE"));
+                assert_eq!(feedback.failed_criteria.len(), 1);
+                let failed = &feedback.failed_criteria[0];
+                assert_eq!(failed.name, "output_matches[0]");
+                assert!(matches!(
+                    &failed.details,
+                    FailureDetails::OutputMatches { regex, .. } if regex == "^DONE$"
+                ));
             }
             other => panic!("expected Retry, got {other:?}"),
         }
@@ -683,8 +732,21 @@ mod tests {
             .await;
         match &report.decision {
             AuditDecision::Retry { feedback, .. } => {
-                assert!(feedback.contains("Tests failed"));
-                assert!(feedback.contains("boom"));
+                assert_eq!(feedback.failed_criteria.len(), 1);
+                let failed = &feedback.failed_criteria[0];
+                assert_eq!(failed.name, "tests_pass");
+                assert_eq!(failed.kind, CriterionKind::TestsPass);
+                match &failed.details {
+                    FailureDetails::TestsPass {
+                        exit_code,
+                        stderr_excerpt,
+                        ..
+                    } => {
+                        assert_eq!(*exit_code, 2);
+                        assert!(stderr_excerpt.contains("boom"));
+                    }
+                    other => panic!("expected tests_pass details, got {other:?}"),
+                }
             }
             other => panic!("expected Retry, got {other:?}"),
         }
@@ -703,7 +765,18 @@ mod tests {
         );
         let auditor = PatternAuditor::with_process_timeout(Duration::from_millis(150));
         let report = auditor.audit(&spec, &ctx_for(&spec), &outcome("x")).await;
-        assert!(matches!(report.decision, AuditDecision::Retry { .. }));
+        match &report.decision {
+            AuditDecision::Retry { feedback, .. } => {
+                assert_eq!(feedback.failed_criteria.len(), 1);
+                match &feedback.failed_criteria[0].details {
+                    FailureDetails::TestsPass { stderr_excerpt, .. } => {
+                        assert_eq!(stderr_excerpt, "");
+                    }
+                    other => panic!("expected tests_pass details, got {other:?}"),
+                }
+            }
+            other => panic!("expected Retry, got {other:?}"),
+        }
         assert_eq!(report.criterion_results.len(), 1);
         let cr = &report.criterion_results[0];
         assert!(!cr.passed);
@@ -728,7 +801,15 @@ mod tests {
         let report = PatternAuditor::new()
             .audit(&spec, &ctx_for(&spec), &outcome("x"))
             .await;
-        assert!(matches!(report.decision, AuditDecision::Retry { .. }));
+        match &report.decision {
+            AuditDecision::Retry { feedback, .. } => {
+                assert_eq!(feedback.failed_criteria.len(), 1);
+                let failed = &feedback.failed_criteria[0];
+                assert_eq!(failed.name, "custom[0:my_check]");
+                assert_eq!(failed.kind, CriterionKind::Custom);
+            }
+            other => panic!("expected Retry, got {other:?}"),
+        }
         let cr = &report.criterion_results[0];
         assert!(cr.name.starts_with("custom["));
         assert!(!cr.passed);

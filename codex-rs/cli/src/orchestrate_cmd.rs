@@ -267,6 +267,10 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
     match report.decision {
         AuditDecision::Ok { .. } => Ok(()),
         AuditDecision::Retry { feedback, attempt } => {
+            let feedback = serde_json::to_string_pretty(&feedback).unwrap_or_else(|_| {
+                r#"{"failed_criteria":[{"name":"retry_feedback","details":"unserializable"}]}"#
+                    .to_string()
+            });
             anyhow::bail!(
                 "audit verdict: retry (attempt {attempt}). Retry loop arrives in commit 5.\n\
                  Feedback:\n{feedback}"

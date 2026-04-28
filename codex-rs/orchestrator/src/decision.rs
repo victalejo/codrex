@@ -25,7 +25,10 @@ pub enum AuditDecision {
     /// `attempt` is the 1-indexed retry number — the FIRST retry is
     /// `attempt=1`, NOT 0. The auditor doesn't manage the counter; the
     /// orchestrator's retry loop assigns it before the next dispatch.
-    Retry { feedback: String, attempt: u8 },
+    Retry {
+        feedback: RetryFeedback,
+        attempt: u8,
+    },
 
     /// The failure looks structural (forbidden pattern matched, custom
     /// check failed irrecoverably, MiniMax asked for clarification we
@@ -40,6 +43,44 @@ pub enum AuditDecision {
     /// errored before a real response, the spec was invalid retroactively).
     /// Log and abort silently — no user input expected.
     Drop { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RetryFeedback {
+    pub failed_criteria: Vec<FailedCriterion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FailedCriterion {
+    pub name: String,
+    pub kind: CriterionKind,
+    pub details: FailureDetails,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CriterionKind {
+    OutputMatches,
+    TestsPass,
+    Custom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FailureDetails {
+    OutputMatches {
+        regex: String,
+        output_excerpt: String,
+    },
+    TestsPass {
+        exit_code: i32,
+        stderr_excerpt: String,
+        command: Vec<String>,
+    },
+    Custom {
+        exit_code: i32,
+        stderr_excerpt: String,
+    },
 }
 
 impl AuditDecision {
@@ -60,12 +101,41 @@ mod tests {
 
     #[test]
     fn audit_decision_serde_round_trip_for_each_variant() {
+        let retry_feedback = RetryFeedback {
+            failed_criteria: vec![
+                FailedCriterion {
+                    name: "output_matches[0]".to_string(),
+                    kind: CriterionKind::OutputMatches,
+                    details: FailureDetails::OutputMatches {
+                        regex: r"^DONE$".to_string(),
+                        output_excerpt: "x".to_string(),
+                    },
+                },
+                FailedCriterion {
+                    name: "tests_pass".to_string(),
+                    kind: CriterionKind::TestsPass,
+                    details: FailureDetails::TestsPass {
+                        exit_code: 1,
+                        stderr_excerpt: "boom".to_string(),
+                        command: vec!["pytest".to_string()],
+                    },
+                },
+                FailedCriterion {
+                    name: "custom[0:health]".to_string(),
+                    kind: CriterionKind::Custom,
+                    details: FailureDetails::Custom {
+                        exit_code: 2,
+                        stderr_excerpt: "fail".to_string(),
+                    },
+                },
+            ],
+        };
         let cases = [
             AuditDecision::Ok {
                 rationale: "all checks passed".into(),
             },
             AuditDecision::Retry {
-                feedback: "test_email_invalid failed: expected ValidationError".into(),
+                feedback: retry_feedback,
                 attempt: 1,
             },
             AuditDecision::Escalate {
@@ -111,7 +181,9 @@ mod tests {
         assert!(AuditDecision::Drop { reason: "x".into() }.is_terminal());
         assert!(
             !AuditDecision::Retry {
-                feedback: "x".into(),
+                feedback: RetryFeedback {
+                    failed_criteria: vec![],
+                },
                 attempt: 1
             }
             .is_terminal()
