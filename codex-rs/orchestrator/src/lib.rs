@@ -50,6 +50,7 @@ pub mod decision;
 pub mod dispatch;
 pub mod error;
 pub mod log;
+pub mod runner;
 pub mod spec;
 pub mod traits;
 
@@ -63,6 +64,8 @@ pub use log::Clock;
 pub use log::InMemoryDecisionLog;
 pub use log::JsonlDecisionLog;
 pub use log::SystemClock;
+pub use runner::OrchestrateOutcome;
+pub use runner::run_orchestration_loop;
 pub use spec::AcceptanceCriterion;
 pub use spec::DelegationSpec;
 pub use spec::ScriptRef;

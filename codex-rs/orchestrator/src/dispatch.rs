@@ -42,6 +42,7 @@ use futures::StreamExt;
 use tracing::warn;
 
 use crate::context::DelegationContext;
+use crate::decision::RetryFeedback;
 use crate::orch_debug_enabled;
 use crate::spec::DelegationSpec;
 use crate::traits::DispatchError;
@@ -126,8 +127,12 @@ impl MinimaxDispatchSink {
     /// Build the `ChatCompletionRequest` sent to MiniMax. Pure function
     /// over the spec — exposed for tests so they can lock the wire
     /// shape without spinning up the HTTP client.
-    pub fn build_request(&self, spec: &DelegationSpec) -> ChatCompletionRequest {
-        let system_body = render_system_message(spec);
+    pub fn build_request(
+        &self,
+        spec: &DelegationSpec,
+        retry_feedback: Option<&RetryFeedback>,
+    ) -> ChatCompletionRequest {
+        let system_body = render_system_message(spec, retry_feedback);
         let messages = vec![
             ChatMessage::system(system_body),
             ChatMessage::user(spec.intent.clone()),
@@ -136,7 +141,7 @@ impl MinimaxDispatchSink {
     }
 }
 
-fn render_system_message(spec: &DelegationSpec) -> String {
+fn render_system_message(spec: &DelegationSpec, retry_feedback: Option<&RetryFeedback>) -> String {
     use std::fmt::Write;
     let mut s = String::new();
     let _ = writeln!(
@@ -170,6 +175,69 @@ fn render_system_message(spec: &DelegationSpec) -> String {
         "\nIf you need disambiguation BEFORE attempting the task, prefix your response with \
          `CLARIFY:` followed by ONE concrete question. Otherwise complete the task."
     );
+    if let Some(feedback) = retry_feedback
+        && !feedback.failed_criteria.is_empty()
+    {
+        let _ = writeln!(
+            s,
+            "\nPrevious attempt failed acceptance criteria. Address these failures:"
+        );
+        let _ = writeln!(s, "{}", render_retry_feedback(feedback));
+    }
+    s
+}
+
+fn render_retry_feedback(feedback: &RetryFeedback) -> String {
+    use std::fmt::Write;
+
+    let mut s = String::new();
+    let mut idx = 1usize;
+    for criterion in &feedback.failed_criteria {
+        let kind = match criterion.kind {
+            crate::decision::CriterionKind::OutputMatches => "output_matches",
+            crate::decision::CriterionKind::TestsPass => "tests_pass",
+            crate::decision::CriterionKind::Custom => "custom",
+        };
+        let _ = writeln!(s, "{idx}. {} ({kind})", criterion.name);
+        match &criterion.details {
+            crate::decision::FailureDetails::OutputMatches {
+                regex,
+                output_excerpt,
+            } => {
+                let _ = writeln!(s, "   regex: {regex}");
+                let _ = writeln!(
+                    s,
+                    "   output_excerpt: {}",
+                    output_excerpt.replace('\n', " ")
+                );
+            }
+            crate::decision::FailureDetails::TestsPass {
+                exit_code,
+                stderr_excerpt,
+                command,
+            } => {
+                let _ = writeln!(s, "   command: {}", command.join(" "));
+                let _ = writeln!(s, "   exit_code: {exit_code}");
+                let _ = writeln!(
+                    s,
+                    "   stderr_excerpt: {}",
+                    stderr_excerpt.replace('\n', " ")
+                );
+            }
+            crate::decision::FailureDetails::Custom {
+                exit_code,
+                stderr_excerpt,
+            } => {
+                let _ = writeln!(s, "   exit_code: {exit_code}");
+                let _ = writeln!(
+                    s,
+                    "   stderr_excerpt: {}",
+                    stderr_excerpt.replace('\n', " ")
+                );
+            }
+        }
+        idx = idx.saturating_add(1);
+    }
     s
 }
 
@@ -184,7 +252,7 @@ impl DispatchSink for MinimaxDispatchSink {
         let auth = self.resolve_auth()?;
         let base_url = resolve_base_url();
         let client = MinimaxClient::new(self.http.clone(), base_url, auth);
-        let request = self.build_request(spec);
+        let request = self.build_request(spec, ctx.retry_feedback.as_ref());
 
         if orch_debug_enabled() {
             eprintln!(
@@ -310,7 +378,7 @@ mod tests {
     fn build_request_emits_one_system_and_one_user_message() {
         let sink = MinimaxDispatchSink::new("MiniMax-M2.7");
         let spec = spec_with_intent("explain validate_email in python");
-        let req = sink.build_request(&spec);
+        let req = sink.build_request(&spec, None);
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.messages[0].role, "system");
         assert_eq!(req.messages[1].role, "user");
@@ -323,7 +391,7 @@ mod tests {
     fn system_message_includes_clarify_convention() {
         let sink = MinimaxDispatchSink::new("MiniMax-M2.7");
         let spec = spec_with_intent("do x");
-        let req = sink.build_request(&spec);
+        let req = sink.build_request(&spec, None);
         assert!(req.messages[0].content.contains("CLARIFY:"));
     }
 
@@ -333,10 +401,39 @@ mod tests {
         let mut spec = spec_with_intent("do x");
         spec.set_forbidden_patterns(["unsafe", r"std::mem::transmute"])
             .unwrap();
-        let req = sink.build_request(&spec);
+        let req = sink.build_request(&spec, None);
         assert!(req.messages[0].content.contains("AVOID"));
         assert!(req.messages[0].content.contains("unsafe"));
         assert!(req.messages[0].content.contains("std::mem::transmute"));
+    }
+
+    #[test]
+    fn system_message_includes_retry_feedback_when_present() {
+        use crate::decision::CriterionKind;
+        use crate::decision::FailedCriterion;
+        use crate::decision::FailureDetails;
+        use crate::decision::RetryFeedback;
+
+        let sink = MinimaxDispatchSink::new("MiniMax-M2.7");
+        let spec = spec_with_intent("do x");
+        let feedback = RetryFeedback {
+            failed_criteria: vec![FailedCriterion {
+                name: "output_matches[0]".to_string(),
+                kind: CriterionKind::OutputMatches,
+                details: FailureDetails::OutputMatches {
+                    regex: r"^DONE$".to_string(),
+                    output_excerpt: "not done".to_string(),
+                },
+            }],
+        };
+        let req = sink.build_request(&spec, Some(&feedback));
+        assert!(
+            req.messages[0]
+                .content
+                .contains("Previous attempt failed acceptance criteria")
+        );
+        assert!(req.messages[0].content.contains("output_matches[0]"));
+        assert!(req.messages[0].content.contains("regex: ^DONE$"));
     }
 
     fn nonstreaming_chat_response_body(content: &str) -> String {

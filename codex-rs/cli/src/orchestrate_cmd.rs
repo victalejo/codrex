@@ -20,23 +20,27 @@
 //! ```
 //!
 //! Tool execution + real audit policy land in commits 4-5.
+//!
+//! Exit codes:
+//!   - `0`: final verdict `Ok`
+//!   - `1`: infrastructure/dispatch error (auth, transport, parser, etc.)
+//!   - `2`: final verdict `Escalate` (needs user intervention)
+//!   - `3`: final verdict `Drop`
 
 use std::path::PathBuf;
 
 use clap::Args;
 use codex_orchestrator::AcceptanceCriterion;
-use codex_orchestrator::AuditDecision;
 use codex_orchestrator::DelegationContext;
 use codex_orchestrator::DelegationSpec;
 use codex_orchestrator::JsonlDecisionLog;
 use codex_orchestrator::MinimaxDispatchSink;
+use codex_orchestrator::OrchestrateOutcome;
 use codex_orchestrator::PatternAuditor;
 use codex_orchestrator::SpecError;
 use codex_orchestrator::TestSpec;
-use codex_orchestrator::traits::Auditor;
+use codex_orchestrator::run_orchestration_loop;
 use codex_orchestrator::traits::DecisionLog;
-use codex_orchestrator::traits::DispatchError;
-use codex_orchestrator::traits::DispatchSink;
 use codex_orchestrator::traits::LogStage;
 
 const DEFAULT_MINIMAX_MODEL: &str = "MiniMax-M2.7";
@@ -94,7 +98,7 @@ pub struct OrchestrateCli {
     pub max_retries: Option<u8>,
 }
 
-pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
+pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<OrchestrateOutcome> {
     if !cli.force_delegate && !cli.no_delegate {
         anyhow::bail!(
             "Phase 3 commit 3 requires one of `--force-delegate` or `--no-delegate`. \
@@ -131,7 +135,9 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
         )
         .await;
         println!("{}", cli.prompt);
-        return Ok(());
+        return Ok(OrchestrateOutcome::Ok {
+            response_text: cli.prompt,
+        });
     }
 
     // Build the delegation spec. Phase 3 commit 4 surfaces forbidden
@@ -140,7 +146,6 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
     // arrives in commit 6 and replaces these with rules-driven config.
     let spec = build_delegation_spec(&cli)?;
     let ctx = DelegationContext::for_top_level(&spec);
-
     log.record(
         &ctx,
         LogStage::Classify,
@@ -153,139 +158,37 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
     .await;
 
     let sink = MinimaxDispatchSink::new(&cli.model);
-    log.record(
-        &ctx,
-        LogStage::DispatchStart,
-        serde_json::json!({"provider": "minimax", "model": cli.model}),
-    )
-    .await;
-
-    let outcome = match sink.dispatch(&spec, &ctx).await {
-        Ok(o) => o,
-        Err(DispatchError::ClarificationRequested { question }) => {
-            // Per the Phase 3 plan adjustment, surface CLARIFY:
-            // requests with a clear "not yet implemented" hint until
-            // commit 8 lands the round-trip.
-            log.record(
-                &ctx,
-                LogStage::Clarify,
-                serde_json::json!({"question": question, "handled": false}),
-            )
-            .await;
-            log.record(
-                &ctx,
-                LogStage::Decision,
-                serde_json::json!({
-                    "verdict": "escalate",
-                    "reason": "model requested clarification",
-                    "blocking_issue": question,
-                }),
-            )
-            .await;
-            anyhow::bail!(
-                "MiniMax requested clarification but CLARIFY: handling is not yet \
-                 implemented (lands in Phase 3 commit 8).\nQuestion: {question}\n\
-                 Refine your prompt and re-run."
-            );
-        }
-        Err(other) => {
-            log.record(
-                &ctx,
-                LogStage::DispatchEnd,
-                serde_json::json!({"error": other.to_string()}),
-            )
-            .await;
-            log.record(
-                &ctx,
-                LogStage::Decision,
-                serde_json::json!({
-                    "verdict": "drop",
-                    "reason": format!("dispatch error: {other}"),
-                }),
-            )
-            .await;
-            anyhow::bail!("dispatch failed: {other}");
-        }
-    };
-
-    log.record(
-        &ctx,
-        LogStage::DispatchEnd,
-        serde_json::json!({
-            "latency_ms": outcome.latency_ms,
-            "total_tokens": outcome.total_tokens,
-            "response_len": outcome.response_text.len(),
-        }),
-    )
-    .await;
-
     let auditor = PatternAuditor::new();
-    let report = auditor.audit(&spec, &ctx, &outcome).await;
-
-    // Emit one row per criterion BEFORE the aggregated audit row.
-    // Greppable as `"stage":"audit_criterion"` for dashboards of
-    // "which criteria fail most".
-    for cr in &report.criterion_results {
-        log.record(
-            &ctx,
-            LogStage::AuditCriterion,
-            serde_json::json!({
-                "name": cr.name,
-                "passed": cr.passed,
-                "duration_ms": cr.duration_ms,
-                "details": cr.details,
-            }),
-        )
-        .await;
-    }
-
-    log.record(
-        &ctx,
-        LogStage::Audit,
-        serde_json::to_value(&report.decision).unwrap_or_else(|_| serde_json::json!({})),
-    )
-    .await;
-
-    let verdict_label = match &report.decision {
-        AuditDecision::Ok { .. } => "ok",
-        AuditDecision::Retry { .. } => "retry",
-        AuditDecision::Escalate { .. } => "escalate",
-        AuditDecision::Drop { .. } => "drop",
-    };
-    log.record(
-        &ctx,
-        LogStage::Decision,
-        serde_json::json!({"verdict": verdict_label}),
-    )
-    .await;
-
-    // Phase 3 commit 4 LITE: the orchestrate command reports the
-    // verdict but doesn't yet act on Retry/Escalate/Drop (that wiring
-    // arrives in commit 5). For now we print the response and exit
-    // with a status code that signals the verdict to scripts.
-    println!("{}", outcome.response_text);
-    match report.decision {
-        AuditDecision::Ok { .. } => Ok(()),
-        AuditDecision::Retry { feedback, attempt } => {
-            let feedback = serde_json::to_string_pretty(&feedback).unwrap_or_else(|_| {
-                r#"{"failed_criteria":[{"name":"retry_feedback","details":"unserializable"}]}"#
-                    .to_string()
-            });
-            anyhow::bail!(
-                "audit verdict: retry (attempt {attempt}). Retry loop arrives in commit 5.\n\
-                 Feedback:\n{feedback}"
-            )
+    let outcome = run_orchestration_loop(&spec, &cli.model, &sink, &auditor, &log)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    match &outcome {
+        OrchestrateOutcome::Ok { response_text } => {
+            println!("{response_text}");
         }
-        AuditDecision::Escalate {
+        OrchestrateOutcome::Escalate {
             reason,
             blocking_issue,
+            attempts_exhausted,
         } => {
-            anyhow::bail!("audit verdict: escalate. {reason}\nBlocking issue: {blocking_issue}")
+            eprintln!("audit verdict: escalate. {reason}");
+            eprintln!("blocking_issue: {blocking_issue}");
+            if let Some(attempts_exhausted) = attempts_exhausted {
+                eprintln!("attempts_exhausted: {attempts_exhausted}");
+            }
         }
-        AuditDecision::Drop { reason } => {
-            anyhow::bail!("audit verdict: drop. {reason}")
+        OrchestrateOutcome::Drop {
+            reason,
+            repeated_signature,
+        } => {
+            eprintln!("audit verdict: drop. {reason}");
+            if let Some(repeated_signature) = repeated_signature {
+                eprintln!("repeated_signature: {repeated_signature}");
+            }
         }
     }
+
+    Ok(outcome)
 }
 
 fn build_delegation_spec(cli: &OrchestrateCli) -> anyhow::Result<DelegationSpec> {

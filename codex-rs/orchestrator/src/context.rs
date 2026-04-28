@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::decision::RetryFeedback;
 use crate::spec::DelegationSpec;
 
 /// Lightweight context object passed to every stage in the pipeline.
@@ -39,6 +40,8 @@ pub struct DelegationContext {
     /// `started_at_unix_ms` field that's filled by the logger.
     #[serde(skip, default = "Instant::now")]
     pub started_at: Instant,
+    #[serde(skip)]
+    pub retry_feedback: Option<RetryFeedback>,
 }
 
 impl DelegationContext {
@@ -50,6 +53,7 @@ impl DelegationContext {
             parent_run_id: None,
             attempt: 0,
             started_at: Instant::now(),
+            retry_feedback: None,
         }
     }
 
@@ -61,6 +65,7 @@ impl DelegationContext {
             parent_run_id: Some(parent.run_id),
             attempt: 0,
             started_at: Instant::now(),
+            retry_feedback: None,
         }
     }
 
@@ -69,6 +74,14 @@ impl DelegationContext {
     pub fn next_attempt(&self) -> Self {
         Self {
             attempt: self.attempt.saturating_add(1),
+            ..self.clone()
+        }
+    }
+
+    pub fn next_attempt_with_feedback(&self, retry_feedback: RetryFeedback) -> Self {
+        Self {
+            attempt: self.attempt.saturating_add(1),
+            retry_feedback: Some(retry_feedback),
             ..self.clone()
         }
     }
