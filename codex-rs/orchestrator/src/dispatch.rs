@@ -324,7 +324,8 @@ mod tests {
     fn system_message_lists_forbidden_patterns_when_present() {
         let sink = MinimaxDispatchSink::new("MiniMax-M2.7");
         let mut spec = spec_with_intent("do x");
-        spec.forbidden_patterns = vec!["unsafe".into(), r"std::mem::transmute".into()];
+        spec.set_forbidden_patterns(["unsafe", r"std::mem::transmute"])
+            .unwrap();
         let req = sink.build_request(&spec);
         assert!(req.messages[0].content.contains("AVOID"));
         assert!(req.messages[0].content.contains("unsafe"));

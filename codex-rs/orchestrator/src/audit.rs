@@ -49,7 +49,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use regex::Regex;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 use tokio::process::Command;
@@ -352,14 +351,10 @@ fn check_no_forbidden_patterns(
     let started = Instant::now();
     let mut matches: Vec<JsonValue> = Vec::new();
     for pattern in &spec.forbidden_patterns {
-        // Spec validation guaranteed compilation succeeds.
-        let Ok(re) = Regex::new(pattern) else {
-            continue;
-        };
-        if let Some(m) = re.find(&outcome.response_text) {
+        if let Some(m) = pattern.regex().find(&outcome.response_text) {
             let snippet = snippet_around(&outcome.response_text, m.start(), m.end(), 80);
             matches.push(json!({
-                "pattern": pattern,
+                "pattern": pattern.as_str(),
                 "match_start": m.start(),
                 "match_end": m.end(),
                 "snippet": snippet,
@@ -383,10 +378,13 @@ fn check_no_forbidden_patterns(
     }
 }
 
-fn check_output_matches(idx: usize, regex: &str, outcome: &DispatchOutcome) -> CriterionResult {
+fn check_output_matches(
+    idx: usize,
+    regex: &crate::spec::ValidatedRegex,
+    outcome: &DispatchOutcome,
+) -> CriterionResult {
     let started = Instant::now();
-    let re = Regex::new(regex).expect("spec validation guarantees compile");
-    let matched = re.is_match(&outcome.response_text);
+    let matched = regex.regex().is_match(&outcome.response_text);
     let duration_ms = started.elapsed().as_millis() as u64;
     if orch_debug_enabled() {
         eprintln!(
@@ -397,7 +395,7 @@ fn check_output_matches(idx: usize, regex: &str, outcome: &DispatchOutcome) -> C
         name: format!("output_matches[{idx}]"),
         passed: matched,
         duration_ms,
-        details: json!({"regex": regex, "matched": matched}),
+        details: json!({"regex": regex.as_str(), "matched": matched}),
     }
 }
 
@@ -542,17 +540,19 @@ mod tests {
         acceptance: Vec<AcceptanceCriterion>,
         expected_tests: Option<TestSpec>,
     ) -> DelegationSpec {
-        let spec = DelegationSpec {
+        let mut spec = DelegationSpec {
             run_id: Uuid::new_v4(),
             parent_run_id: None,
             intent: intent.into(),
             acceptance,
-            forbidden_patterns: forbidden.into_iter().map(String::from).collect(),
+            forbidden_patterns: Vec::new(),
             expected_tests,
             utility_refs: Vec::new(),
             max_retries: 2,
             created_at: SystemTime::UNIX_EPOCH,
         };
+        spec.set_forbidden_patterns(forbidden)
+            .expect("forbidden patterns must compile");
         spec.validate().expect("test spec must validate");
         spec
     }
@@ -584,9 +584,7 @@ mod tests {
             vec!["unsafe"],
             vec![
                 AcceptanceCriterion::NoForbiddenPatterns,
-                AcceptanceCriterion::OutputMatches {
-                    regex: r"^OK\b".into(),
-                },
+                AcceptanceCriterion::output_matches(r"^OK\b").unwrap(),
             ],
             None,
         );
@@ -631,9 +629,7 @@ mod tests {
         let spec = spec_with(
             "x",
             vec![],
-            vec![AcceptanceCriterion::OutputMatches {
-                regex: r"^DONE$".into(),
-            }],
+            vec![AcceptanceCriterion::output_matches(r"^DONE$").unwrap()],
             None,
         );
         let report = PatternAuditor::new()

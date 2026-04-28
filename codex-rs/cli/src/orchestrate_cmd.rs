@@ -31,6 +31,7 @@ use codex_orchestrator::DelegationSpec;
 use codex_orchestrator::JsonlDecisionLog;
 use codex_orchestrator::MinimaxDispatchSink;
 use codex_orchestrator::PatternAuditor;
+use codex_orchestrator::SpecError;
 use codex_orchestrator::TestSpec;
 use codex_orchestrator::traits::Auditor;
 use codex_orchestrator::traits::DecisionLog;
@@ -285,7 +286,8 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
 
 fn build_delegation_spec(cli: &OrchestrateCli) -> anyhow::Result<DelegationSpec> {
     let mut spec = DelegationSpec::new_bare(&cli.prompt)?;
-    spec.forbidden_patterns = cli.forbidden.clone();
+    spec.set_forbidden_patterns(cli.forbidden.clone())
+        .map_err(|e| anyhow::anyhow!("invalid spec built from flags: {e}"))?;
     if let Some(max_retries) = cli.max_retries {
         spec.max_retries = max_retries;
     }
@@ -293,10 +295,14 @@ fn build_delegation_spec(cli: &OrchestrateCli) -> anyhow::Result<DelegationSpec>
     if !cli.forbidden.is_empty() {
         acceptance.push(AcceptanceCriterion::NoForbiddenPatterns);
     }
-    for regex in &cli.require_output_match {
-        acceptance.push(AcceptanceCriterion::OutputMatches {
-            regex: regex.clone(),
-        });
+    for (index, regex) in cli.require_output_match.iter().enumerate() {
+        let criterion = AcceptanceCriterion::output_matches(regex).map_err(|source| {
+            anyhow::anyhow!(
+                "invalid spec built from flags: {}",
+                SpecError::InvalidOutputMatchesRegex { index, source }
+            )
+        })?;
+        acceptance.push(criterion);
     }
     if let Some(cmd_str) = cli.require_tests_cmd.as_deref()
         && !cmd_str.trim().is_empty()

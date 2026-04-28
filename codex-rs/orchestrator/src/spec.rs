@@ -13,8 +13,8 @@
 //!
 //! ## Validation
 //!
-//! `DelegationSpec` enforces invariants at construction time via
-//! [`DelegationSpec::validate`]. This includes:
+//! `DelegationSpec` and [`ValidatedRegex`] enforce invariants at
+//! construction/deserialization time. This includes:
 //!
 //! - Non-empty intent.
 //! - Every entry in `forbidden_patterns` compiles as a regex.
@@ -27,19 +27,80 @@
 //! - `max_retries <= 10` (sanity bound).
 //!
 //! Failing fast at parse keeps invalid specs out of the dispatch loop —
-//! the audit phase can rely on every regex being already-validated.
+//! the audit phase can rely on every regex being already compiled.
 
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use regex::Regex;
+use serde::Deserializer;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::Serializer;
 use uuid::Uuid;
 
 use crate::error::SpecError;
 
 const DEFAULT_MAX_RETRIES: u8 = 2;
 const MAX_ALLOWED_RETRIES: u8 = 10;
+
+/// Regex wrapper that preserves the original wire shape (`"pattern"`)
+/// while holding onto a compiled `Regex` for runtime use.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct ValidatedRegex {
+    source: String,
+    compiled: Regex,
+}
+
+impl ValidatedRegex {
+    pub fn new(source: impl Into<String>) -> Result<Self, regex::Error> {
+        let source = source.into();
+        let compiled = Regex::new(&source)?;
+        Ok(Self { source, compiled })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.source
+    }
+
+    pub fn regex(&self) -> &Regex {
+        &self.compiled
+    }
+}
+
+impl std::fmt::Display for ValidatedRegex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl PartialEq for ValidatedRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
+impl Eq for ValidatedRegex {}
+
+impl Serialize for ValidatedRegex {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.source)
+    }
+}
+
+impl<'de> Deserialize<'de> for ValidatedRegex {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let source = String::deserialize(deserializer)?;
+        Self::new(source).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Structured plan for a single delegation. Built by the classifier,
 /// consumed by dispatch + audit, logged in JSONL.
@@ -66,7 +127,7 @@ pub struct DelegationSpec {
     /// construction time so the audit phase doesn't need to handle
     /// compile errors. Empty when no forbidden constraints apply.
     #[serde(default)]
-    pub forbidden_patterns: Vec<String>,
+    pub forbidden_patterns: Vec<ValidatedRegex>,
 
     /// Optional test command to run after applying the response. Phase
     /// 3 LITE shape; Phase 4 will extend with `timeout`,
@@ -111,21 +172,34 @@ impl DelegationSpec {
         Ok(spec)
     }
 
-    /// Run all parse-time invariants. Returns the first error
-    /// encountered so callers see a single clear failure message rather
-    /// than a list to triage.
+    /// Compile and replace the response-blocking regex set while
+    /// preserving the `SpecError` index context used by callers.
+    pub fn set_forbidden_patterns<I, S>(&mut self, patterns: I) -> Result<(), SpecError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.forbidden_patterns = patterns
+            .into_iter()
+            .enumerate()
+            .map(|(index, pattern)| {
+                ValidatedRegex::new(pattern.into())
+                    .map_err(|source| SpecError::InvalidForbiddenPattern { index, source })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(())
+    }
+
+    /// Run the remaining parse-time invariants after regex compilation
+    /// has already succeeded via [`ValidatedRegex`]. Returns the first
+    /// error encountered so callers see a single clear failure message
+    /// rather than a list to triage.
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.intent.trim().is_empty() {
             return Err(SpecError::EmptyIntent);
         }
         if self.max_retries > MAX_ALLOWED_RETRIES {
             return Err(SpecError::MaxRetriesTooLarge(self.max_retries));
-        }
-        for (idx, pat) in self.forbidden_patterns.iter().enumerate() {
-            regex::Regex::new(pat).map_err(|source| SpecError::InvalidForbiddenPattern {
-                index: idx,
-                source,
-            })?;
         }
         for (idx, util) in self.utility_refs.iter().enumerate() {
             if util.symbol.trim().is_empty() {
@@ -152,14 +226,7 @@ impl DelegationSpec {
         criterion: &AcceptanceCriterion,
     ) -> Result<(), SpecError> {
         match criterion {
-            AcceptanceCriterion::OutputMatches { regex } => {
-                regex::Regex::new(regex).map_err(|source| {
-                    SpecError::InvalidOutputMatchesRegex {
-                        index: idx,
-                        source,
-                    }
-                })?;
-            }
+            AcceptanceCriterion::OutputMatches { .. } => {}
             AcceptanceCriterion::TestsPass => {
                 if self.expected_tests.is_none() {
                     return Err(SpecError::TestsPassWithoutExpectedTests(idx));
@@ -195,7 +262,7 @@ impl DelegationSpec {
 pub enum AcceptanceCriterion {
     /// The response (text + applied diffs concatenated) must match this
     /// regex. The pattern is validated at parse time.
-    OutputMatches { regex: String },
+    OutputMatches { regex: ValidatedRegex },
     /// Run `DelegationSpec.expected_tests` and require exit 0. Requires
     /// `expected_tests.is_some()` on the parent spec.
     TestsPass,
@@ -206,6 +273,14 @@ pub enum AcceptanceCriterion {
     /// the orchestrator's working dir unless the script changes it
     /// itself. Phase 3 LITE assumes the script is sandbox-friendly.
     Custom { name: String, check: ScriptRef },
+}
+
+impl AcceptanceCriterion {
+    pub fn output_matches(regex: impl Into<String>) -> Result<Self, regex::Error> {
+        Ok(Self::OutputMatches {
+            regex: ValidatedRegex::new(regex.into())?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -249,18 +324,16 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     fn sample_spec() -> DelegationSpec {
-        DelegationSpec {
+        let mut spec = DelegationSpec {
             run_id: Uuid::nil(),
             parent_run_id: None,
             intent: "implement validate_email".into(),
             acceptance: vec![
-                AcceptanceCriterion::OutputMatches {
-                    regex: r"^OK".into(),
-                },
+                AcceptanceCriterion::output_matches(r"^OK").unwrap(),
                 AcceptanceCriterion::NoForbiddenPatterns,
                 AcceptanceCriterion::TestsPass,
             ],
-            forbidden_patterns: vec!["unsafe".into(), r"std::mem::transmute".into()],
+            forbidden_patterns: Vec::new(),
             expected_tests: Some(TestSpec {
                 command: vec!["cargo".into(), "test".into()],
                 working_dir: Some(PathBuf::from("/tmp")),
@@ -272,7 +345,10 @@ mod tests {
             }],
             max_retries: 3,
             created_at: SystemTime::UNIX_EPOCH,
-        }
+        };
+        spec.set_forbidden_patterns(["unsafe", r"std::mem::transmute"])
+            .unwrap();
+        spec
     }
 
     #[test]
@@ -293,19 +369,40 @@ mod tests {
     }
 
     #[test]
+    fn spec_json_keeps_regex_fields_as_plain_strings() {
+        let json = serde_json::to_value(sample_spec()).expect("serialize");
+        assert_eq!(json["forbidden_patterns"][0], "unsafe");
+        assert_eq!(json["forbidden_patterns"][1], "std::mem::transmute");
+        assert_eq!(json["acceptance"][0]["regex"], "^OK");
+    }
+
+    #[test]
+    fn validated_regex_serializes_as_a_plain_string() {
+        let regex = ValidatedRegex::new(r"^OK$").expect("valid regex");
+        let json = serde_json::to_string(&regex).expect("serialize");
+        assert_eq!(json, r#""^OK$""#);
+    }
+
+    #[test]
+    fn validated_regex_deserializes_from_a_plain_string() {
+        let regex: ValidatedRegex = serde_json::from_str(r#""^OK$""#).expect("deserialize");
+        assert_eq!(regex.as_str(), "^OK$");
+        assert!(regex.regex().is_match("OK"));
+    }
+
+    #[test]
     fn new_bare_rejects_empty_intent() {
         let err = DelegationSpec::new_bare("   ").unwrap_err();
         assert!(matches!(err, SpecError::EmptyIntent));
     }
 
     #[test]
-    fn validate_rejects_invalid_forbidden_regex() {
+    fn set_forbidden_patterns_rejects_invalid_regex() {
         let mut spec = sample_spec();
-        spec.forbidden_patterns.push("(".into()); // unbalanced paren
-        let err = spec.validate().unwrap_err();
+        let err = spec.set_forbidden_patterns(["unsafe", "("]).unwrap_err();
         assert!(matches!(
             err,
-            SpecError::InvalidForbiddenPattern { index: 2, .. }
+            SpecError::InvalidForbiddenPattern { index: 1, .. }
         ));
     }
 
@@ -332,16 +429,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_invalid_output_matches_regex() {
-        let mut spec = sample_spec();
-        spec.acceptance[0] = AcceptanceCriterion::OutputMatches {
-            regex: "[invalid".into(),
-        };
-        let err = spec.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            SpecError::InvalidOutputMatchesRegex { index: 0, .. }
-        ));
+    fn output_matches_constructor_rejects_invalid_regex() {
+        let err = AcceptanceCriterion::output_matches("[invalid").unwrap_err();
+        assert!(matches!(err, regex::Error::Syntax(_)));
     }
 
     #[test]
@@ -385,10 +475,8 @@ mod tests {
         let json = serde_json::to_string(&AcceptanceCriterion::TestsPass).unwrap();
         assert_eq!(json, r#"{"kind":"tests_pass"}"#);
 
-        let json = serde_json::to_string(&AcceptanceCriterion::OutputMatches {
-            regex: "x".into(),
-        })
-        .unwrap();
+        let json = serde_json::to_string(&AcceptanceCriterion::output_matches("x").unwrap())
+            .unwrap();
         assert_eq!(json, r#"{"kind":"output_matches","regex":"x"}"#);
     }
 }
