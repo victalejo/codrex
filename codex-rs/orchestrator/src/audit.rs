@@ -147,92 +147,85 @@ impl Auditor for PatternAuditor {
     ) -> AuditReport {
         let mut criterion_results: Vec<CriterionResult> = Vec::new();
 
-        // Evaluate cheap-to-expensive, short-circuit on first failure.
-        // Indexing semantics:
-        //   - `OutputMatches` and `Custom` can repeat in `spec.acceptance`;
-        //     we tag each with its 0-indexed position (`output_matches[2]`,
-        //     `custom:my_check`).
-        //   - `NoForbiddenPatterns` and `TestsPass` are evaluated once
-        //     even if listed multiple times — the second occurrence
-        //     wouldn't add information.
-        let mut evaluated_no_forbidden = false;
-        let mut evaluated_tests_pass = false;
+        let mut has_no_forbidden = false;
+        let mut output_matches: Vec<(usize, &crate::spec::ValidatedRegex)> = Vec::new();
+        let mut has_tests_pass = false;
+        let mut custom_criteria: Vec<(usize, &str, &ScriptRef)> = Vec::new();
 
         for (idx, criterion) in spec.acceptance.iter().enumerate() {
             match criterion {
                 AcceptanceCriterion::NoForbiddenPatterns => {
-                    if evaluated_no_forbidden {
-                        continue;
-                    }
-                    evaluated_no_forbidden = true;
-                    let result = check_no_forbidden_patterns(spec, outcome);
-                    let passed = result.passed;
-                    let details = result.details.clone();
-                    criterion_results.push(result);
-                    if !passed {
-                        return early_escalate(
-                            criterion_results,
-                            &details,
-                            "no_forbidden_patterns",
-                        );
-                    }
+                    has_no_forbidden = true;
                 }
                 AcceptanceCriterion::OutputMatches { regex } => {
-                    let result = check_output_matches(idx, regex, outcome);
-                    let passed = result.passed;
-                    let details = result.details.clone();
-                    criterion_results.push(result);
-                    if !passed {
-                        return early_retry(
-                            criterion_results,
-                            &failed_output_match(idx, regex, details),
-                            ctx,
-                        );
-                    }
+                    output_matches.push((idx, regex));
                 }
                 AcceptanceCriterion::TestsPass => {
-                    if evaluated_tests_pass {
-                        continue;
-                    }
-                    evaluated_tests_pass = true;
-                    // Spec validation guarantees expected_tests is Some
-                    // when this variant appears. Defensive unwrap_or
-                    // produces a Drop verdict if it ever isn't.
-                    let Some(test_spec) = spec.expected_tests.as_ref() else {
-                        return AuditReport {
-                            decision: AuditDecision::Drop {
-                                reason: "TestsPass criterion present but expected_tests is None \
-                                         (spec validation failure)"
-                                    .to_string(),
-                            },
-                            criterion_results,
-                        };
-                    };
-                    let result = run_test_spec(test_spec, self.process_timeout).await;
-                    let passed = result.passed;
-                    let details = result.details.clone();
-                    criterion_results.push(result);
-                    if !passed {
-                        return early_retry(
-                            criterion_results,
-                            &failed_tests_pass(test_spec, &details),
-                            ctx,
-                        );
-                    }
+                    has_tests_pass = true;
                 }
                 AcceptanceCriterion::Custom { name, check } => {
-                    let result = run_custom_script(idx, name, check, self.process_timeout).await;
-                    let passed = result.passed;
-                    let details = result.details.clone();
-                    criterion_results.push(result);
-                    if !passed {
-                        return early_retry(
-                            criterion_results,
-                            &failed_custom(idx, name, &details),
-                            ctx,
-                        );
-                    }
+                    custom_criteria.push((idx, name.as_str(), check));
                 }
+            }
+        }
+
+        if has_no_forbidden {
+            let result = check_no_forbidden_patterns(spec, outcome);
+            let passed = result.passed;
+            let details = result.details.clone();
+            criterion_results.push(result);
+            if !passed {
+                return early_escalate(criterion_results, &details, "no_forbidden_patterns");
+            }
+        }
+
+        for (idx, regex) in output_matches {
+            let result = check_output_matches(idx, regex, outcome);
+            let passed = result.passed;
+            let details = result.details.clone();
+            criterion_results.push(result);
+            if !passed {
+                return early_retry(
+                    criterion_results,
+                    &failed_output_match(idx, regex, details),
+                    ctx,
+                );
+            }
+        }
+
+        if has_tests_pass {
+            // Spec validation guarantees expected_tests is Some when this
+            // variant appears. Defensive unwrap_or produces a Drop verdict
+            // if it ever isn't.
+            let Some(test_spec) = spec.expected_tests.as_ref() else {
+                return AuditReport {
+                    decision: AuditDecision::Drop {
+                        reason: "TestsPass criterion present but expected_tests is None (spec validation failure)"
+                            .to_string(),
+                    },
+                    criterion_results,
+                };
+            };
+            let result = run_test_spec(test_spec, self.process_timeout).await;
+            let passed = result.passed;
+            let details = result.details.clone();
+            criterion_results.push(result);
+            if !passed {
+                return early_retry(
+                    criterion_results,
+                    &failed_tests_pass(test_spec, &details),
+                    ctx,
+                );
+            }
+        }
+
+        for (idx, name, check) in custom_criteria {
+            let result = run_custom_script(idx, name, check, self.process_timeout).await;
+            let passed = result.passed;
+            let details = result.details.clone();
+            criterion_results.push(result);
+            if !passed {
+                return early_retry(criterion_results, &failed_custom(idx, name, &details), ctx);
             }
         }
 
@@ -547,6 +540,8 @@ mod tests {
     use crate::spec::AcceptanceCriterion;
     use crate::spec::TestSpec;
     use pretty_assertions::assert_eq;
+    use std::env;
+    use std::fs;
     use std::path::PathBuf;
     use std::time::SystemTime;
     use uuid::Uuid;
@@ -706,6 +701,55 @@ mod tests {
             1,
             "TestsPass must not run after NoForbiddenPatterns fails"
         );
+        assert_eq!(report.criterion_results[0].name, "no_forbidden_patterns");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unordered_acceptance_keeps_forbidden_first_and_skips_tests() {
+        let side_effect_file = env::temp_dir().join(format!(
+            "codex-orch-tests-pass-not-spawned-{}.txt",
+            Uuid::new_v4()
+        ));
+        let _ = fs::remove_file(&side_effect_file);
+
+        let spec = spec_with(
+            "x",
+            vec!["forbidden"],
+            vec![
+                AcceptanceCriterion::TestsPass,
+                AcceptanceCriterion::NoForbiddenPatterns,
+            ],
+            Some(TestSpec {
+                // Side effect should not run because forbidden match wins.
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "touch \"$1\"".into(),
+                    "sh".into(),
+                    side_effect_file.to_string_lossy().into(),
+                ],
+                working_dir: None,
+            }),
+        );
+
+        let report = PatternAuditor::new()
+            .audit(&spec, &ctx_for(&spec), &outcome("contains forbidden token"))
+            .await;
+
+        assert!(
+            !side_effect_file.exists(),
+            "tests_pass side-effect must not run when no_forbidden_patterns escalates"
+        );
+        match &report.decision {
+            AuditDecision::Escalate { blocking_issue, .. } => {
+                assert!(
+                    blocking_issue.contains("forbidden"),
+                    "blocking_issue should mention forbidden pattern; got {blocking_issue}"
+                );
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+        assert_eq!(report.criterion_results.len(), 1);
         assert_eq!(report.criterion_results[0].name, "no_forbidden_patterns");
     }
 
