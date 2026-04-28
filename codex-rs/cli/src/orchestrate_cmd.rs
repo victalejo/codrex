@@ -46,6 +46,13 @@ use codex_orchestrator::traits::LogStage;
 const DEFAULT_MINIMAX_MODEL: &str = "MiniMax-M2.7";
 
 #[derive(Debug, Args)]
+#[doc = "Orchestrate a delegated turn through the MiniMax orchestrator pipeline.
+
+Exit codes:
+  0 — final verdict Ok (response accepted)
+  1 — infrastructure/dispatch error (auth failure, transport error, etc.)
+  2 — final verdict Escalate (needs user intervention)
+  3 — final verdict Drop (loop detected or unrecoverable)"]
 pub struct OrchestrateCli {
     /// The user prompt / intent to orchestrate.
     pub prompt: String,

@@ -152,10 +152,25 @@ impl CriterionKind {
 }
 
 pub fn error_signature_for_retry_feedback(feedback: &RetryFeedback) -> Option<String> {
-    feedback
+    if feedback.failed_criteria.is_empty() {
+        return None;
+    }
+    let mut sigs: Vec<String> = feedback
         .failed_criteria
-        .first()
+        .iter()
         .map(FailedCriterion::error_signature)
+        .collect();
+    sigs.sort();
+    let combined = sigs.join("|");
+    let mut hasher = Sha256::new();
+    hasher.update(combined.as_bytes());
+    let hash = hasher.finalize();
+    Some(
+        hash.iter()
+            .map(|byte| format!("{byte:02x}"))
+            .take(16)
+            .collect::<String>(),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -307,32 +322,83 @@ mod tests {
     }
 
     #[test]
-    fn feedback_signature_uses_first_failed_criterion_only() {
-        let feedback = RetryFeedback {
-            failed_criteria: vec![
-                FailedCriterion {
-                    name: "output_matches[0]".to_string(),
-                    kind: CriterionKind::OutputMatches,
-                    details: FailureDetails::OutputMatches {
-                        regex: r"^DONE$".to_string(),
-                        output_excerpt: "x".to_string(),
-                    },
-                },
-                FailedCriterion {
-                    name: "tests_pass".to_string(),
-                    kind: CriterionKind::TestsPass,
-                    details: FailureDetails::TestsPass {
-                        exit_code: 1,
-                        stderr_excerpt: "z".to_string(),
-                        command: vec!["python3".to_string()],
-                    },
-                },
-            ],
+    fn feedback_signature_is_sorted_aggregate_of_all_criteria() {
+        let c1 = FailedCriterion {
+            name: "output_matches[0]".to_string(),
+            kind: CriterionKind::OutputMatches,
+            details: FailureDetails::OutputMatches {
+                regex: r"^DONE$".to_string(),
+                output_excerpt: "abc".to_string(),
+            },
         };
+        let c2 = FailedCriterion {
+            name: "tests_pass".to_string(),
+            kind: CriterionKind::TestsPass,
+            details: FailureDetails::TestsPass {
+                exit_code: 1,
+                stderr_excerpt: "xyz".to_string(),
+                command: vec!["python3".to_string()],
+            },
+        };
+        let feedback_forward = RetryFeedback {
+            failed_criteria: vec![c1.clone(), c2.clone()],
+        };
+        let feedback_reverse = RetryFeedback {
+            failed_criteria: vec![c2.clone(), c1.clone()],
+        };
+        let sig_forward = error_signature_for_retry_feedback(&feedback_forward);
+        let sig_reverse = error_signature_for_retry_feedback(&feedback_reverse);
         assert_eq!(
-            error_signature_for_retry_feedback(&feedback).as_deref(),
-            Some(feedback.failed_criteria[0].error_signature().as_str())
+            sig_forward, sig_reverse,
+            "same criteria in different order must produce same signature"
         );
+        let sig1 = c1.error_signature();
+        let sig2 = c2.error_signature();
+        let mut sorted_sigs = vec![sig1, sig2];
+        sorted_sigs.sort();
+        let expected_combined = sorted_sigs.join("|");
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(expected_combined.as_bytes());
+        let hash = hasher.finalize();
+        let expected: String = hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .take(16)
+            .collect();
+        assert_eq!(sig_forward.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn feedback_signature_empty_when_no_failed_criteria() {
+        let feedback = RetryFeedback {
+            failed_criteria: vec![],
+        };
+        assert_eq!(error_signature_for_retry_feedback(&feedback), None);
+    }
+
+    #[test]
+    fn feedback_signature_different_when_criteria_differ() {
+        let feedback1 = RetryFeedback {
+            failed_criteria: vec![FailedCriterion {
+                name: "output_matches[0]".to_string(),
+                kind: CriterionKind::OutputMatches,
+                details: FailureDetails::OutputMatches {
+                    regex: r"^DONE$".to_string(),
+                    output_excerpt: "abc".to_string(),
+                },
+            }],
+        };
+        let feedback2 = RetryFeedback {
+            failed_criteria: vec![FailedCriterion {
+                name: "output_matches[0]".to_string(),
+                kind: CriterionKind::OutputMatches,
+                details: FailureDetails::OutputMatches {
+                    regex: r"^DONE$".to_string(),
+                    output_excerpt: "xyz".to_string(),
+                },
+            }],
+        };
+        assert_ne!(feedback1, feedback2);
     }
 
     #[test]

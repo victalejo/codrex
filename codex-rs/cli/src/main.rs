@@ -177,9 +177,9 @@ enum Subcommand {
     /// Phase 3 — orchestrate a delegated turn through MiniMax.
     ///
     /// Runs the prompt through the orchestrator pipeline (classify →
-    /// dispatch → audit → log). Phase 3 commit 3 requires
-    /// `--force-delegate` or `--no-delegate`; auto-classification
-    /// arrives in commit 6.
+    /// dispatch → audit → log). Supports retry loops with error-signature
+    /// deduplication and max-retries escalation. Exit codes: 0=Ok,
+    /// 1=infra error, 2=Escalate, 3=Drop.
     #[clap(visible_alias = "o")]
     Orchestrate(orchestrate_cmd::OrchestrateCli),
 }
@@ -1198,7 +1198,10 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 root_remote_auth_token_env.as_deref(),
                 "orchestrate",
             )?;
-            orchestrate_cmd::run_orchestrate(orch_cli).await?;
+            let outcome = orchestrate_cmd::run_orchestrate(orch_cli).await?;
+            if outcome.exit_code() != 0 {
+                std::process::exit(i32::from(outcome.exit_code()));
+            }
         }
         Some(Subcommand::Apply(mut apply_cli)) => {
             reject_remote_mode_for_subcommand(
