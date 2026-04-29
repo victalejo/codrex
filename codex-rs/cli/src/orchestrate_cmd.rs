@@ -86,6 +86,11 @@ pub struct OrchestrateCli {
     /// for that.
     #[arg(long = "require-tests-cmd")]
     pub require_tests_cmd: Option<String>,
+
+    /// Maximum retry attempts on AuditDecision::Retry before
+    /// escalating. Default 2 (set by DelegationSpec), capped at 10.
+    #[arg(long = "max-retries")]
+    pub max_retries: Option<u8>,
 }
 
 pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
@@ -132,32 +137,7 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
     // patterns, output regex, and a test command via flags so manual
     // E2E demos can exercise every audit code path. Auto-classification
     // arrives in commit 6 and replaces these with rules-driven config.
-    let mut spec = DelegationSpec::new_bare(&cli.prompt)?;
-    spec.forbidden_patterns = cli.forbidden.clone();
-    let mut acceptance: Vec<AcceptanceCriterion> = Vec::new();
-    if !cli.forbidden.is_empty() {
-        acceptance.push(AcceptanceCriterion::NoForbiddenPatterns);
-    }
-    for regex in &cli.require_output_match {
-        acceptance.push(AcceptanceCriterion::OutputMatches {
-            regex: regex.clone(),
-        });
-    }
-    if let Some(cmd_str) = cli.require_tests_cmd.as_deref()
-        && !cmd_str.trim().is_empty()
-    {
-        let parts: Vec<String> = cmd_str.split_whitespace().map(String::from).collect();
-        if !parts.is_empty() {
-            spec.expected_tests = Some(TestSpec {
-                command: parts,
-                working_dir: None,
-            });
-            acceptance.push(AcceptanceCriterion::TestsPass);
-        }
-    }
-    spec.acceptance = acceptance;
-    spec.validate()
-        .map_err(|e| anyhow::anyhow!("invalid spec built from flags: {e}"))?;
+    let spec = build_delegation_spec(&cli)?;
     let ctx = DelegationContext::for_top_level(&spec);
 
     log.record(
@@ -295,14 +275,45 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<()> {
             reason,
             blocking_issue,
         } => {
-            anyhow::bail!(
-                "audit verdict: escalate. {reason}\nBlocking issue: {blocking_issue}"
-            )
+            anyhow::bail!("audit verdict: escalate. {reason}\nBlocking issue: {blocking_issue}")
         }
         AuditDecision::Drop { reason } => {
             anyhow::bail!("audit verdict: drop. {reason}")
         }
     }
+}
+
+fn build_delegation_spec(cli: &OrchestrateCli) -> anyhow::Result<DelegationSpec> {
+    let mut spec = DelegationSpec::new_bare(&cli.prompt)?;
+    spec.forbidden_patterns = cli.forbidden.clone();
+    if let Some(max_retries) = cli.max_retries {
+        spec.max_retries = max_retries;
+    }
+    let mut acceptance: Vec<AcceptanceCriterion> = Vec::new();
+    if !cli.forbidden.is_empty() {
+        acceptance.push(AcceptanceCriterion::NoForbiddenPatterns);
+    }
+    for regex in &cli.require_output_match {
+        acceptance.push(AcceptanceCriterion::OutputMatches {
+            regex: regex.clone(),
+        });
+    }
+    if let Some(cmd_str) = cli.require_tests_cmd.as_deref()
+        && !cmd_str.trim().is_empty()
+    {
+        let parts: Vec<String> = cmd_str.split_whitespace().map(String::from).collect();
+        if !parts.is_empty() {
+            spec.expected_tests = Some(TestSpec {
+                command: parts,
+                working_dir: None,
+            });
+            acceptance.push(AcceptanceCriterion::TestsPass);
+        }
+    }
+    spec.acceptance = acceptance;
+    spec.validate()
+        .map_err(|e| anyhow::anyhow!("invalid spec built from flags: {e}"))?;
+    Ok(spec)
 }
 
 fn build_log(custom_dir: Option<&std::path::Path>) -> anyhow::Result<JsonlDecisionLog> {
@@ -315,4 +326,44 @@ fn build_log(custom_dir: Option<&std::path::Path>) -> anyhow::Result<JsonlDecisi
         }
     };
     Ok(JsonlDecisionLog::new(dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        orchestrate: OrchestrateCli,
+    }
+
+    #[test]
+    fn max_retries_flag_overrides_delegation_spec() {
+        let cli = TestCli::parse_from([
+            "codrex",
+            "do work",
+            "--force-delegate",
+            "--max-retries",
+            "5",
+        ])
+        .orchestrate;
+
+        let spec = build_delegation_spec(&cli).expect("spec should build from CLI");
+
+        assert_eq!(spec.max_retries, 5);
+    }
+
+    #[test]
+    fn max_retries_defaults_to_delegation_spec_default_when_flag_absent() {
+        let cli = TestCli::parse_from(["codrex", "do work", "--force-delegate"]).orchestrate;
+
+        let spec = build_delegation_spec(&cli).expect("spec should build from CLI");
+
+        // DEFAULT_MAX_RETRIES is private in codex-orchestrator; keep this
+        // aligned with DelegationSpec::new_bare's documented default.
+        assert_eq!(spec.max_retries, 2);
+    }
 }
