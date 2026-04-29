@@ -1,7 +1,20 @@
 use crate::ClassificationOutcome;
 use crate::Classifier;
+use crate::LlmClassification;
+use crate::LlmClient;
+use crate::LlmError;
+use crate::LlmFallbackClassifier;
+use crate::LlmFallbackConfig;
 use crate::RulesClassifier;
+use async_trait::async_trait;
 use pretty_assertions::assert_eq;
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tempfile::TempDir;
 
 const FIRST_MATCH_WINS_TOML: &str = r#"
@@ -62,6 +75,76 @@ name = "leave_me_alone"
 action = "no_delegate"
 patterns = ["(?i)\\bkeep\\b"]
 "#;
+
+#[derive(Debug)]
+struct MockLlmClient {
+    responses: Mutex<HashMap<String, VecDeque<MockLlmResponse>>>,
+    calls: AtomicUsize,
+}
+
+#[derive(Debug, Clone)]
+enum MockLlmResponse {
+    Immediate(Result<LlmClassification, LlmError>),
+    Delayed {
+        delay: Duration,
+        result: Result<LlmClassification, LlmError>,
+    },
+}
+
+impl MockLlmClient {
+    fn with_responses(
+        entries: impl IntoIterator<Item = (&'static str, MockLlmResponse)>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            responses: Mutex::new(entries.into_iter().fold(
+                HashMap::new(),
+                |mut responses, (prompt, response)| {
+                    responses
+                        .entry(prompt.to_string())
+                        .or_insert_with(VecDeque::new)
+                        .push_back(response);
+                    responses
+                },
+            )),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmClient for MockLlmClient {
+    async fn classify(&self, intent: &str) -> Result<LlmClassification, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let response = self
+            .responses
+            .lock()
+            .unwrap()
+            .get_mut(intent)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or_else(|| panic!("missing mock response for {intent:?}"));
+        match response {
+            MockLlmResponse::Immediate(result) => result,
+            MockLlmResponse::Delayed { delay, result } => {
+                tokio::time::sleep(delay).await;
+                result
+            }
+        }
+    }
+}
+
+fn llm_config(enabled: bool) -> LlmFallbackConfig {
+    LlmFallbackConfig {
+        provider: "openai".to_string(),
+        model: "gpt-5-mini".to_string(),
+        timeout: Duration::from_millis(25),
+        cache_size: 256,
+        enabled,
+    }
+}
 
 #[tokio::test]
 async fn delegate_rule_matches_first_wins() {
@@ -199,4 +282,268 @@ async fn defaults_classifier_classifies_canonical_examples() {
             "unexpected classification for prompt {prompt:?}",
         );
     }
+}
+
+#[tokio::test]
+async fn llm_fallback_returns_delegate_when_llm_says_yes() {
+    let client = MockLlmClient::with_responses([(
+        "convert this XML config to YAML format",
+        MockLlmResponse::Immediate(Ok(LlmClassification {
+            should_delegate: true,
+            confidence: 0.85,
+            reasoning: "Request asks for a mechanical code-format translation".to_string(),
+        })),
+    )]);
+    let classifier = LlmFallbackClassifier::new(client, llm_config(true));
+
+    let trace = classifier
+        .classify("convert this XML config to YAML format")
+        .await;
+
+    assert!(matches!(
+        trace.outcome,
+        ClassificationOutcome::Delegate { .. }
+    ));
+    assert_eq!(trace.llm_model.as_deref(), Some("gpt-5-mini"));
+    assert_eq!(trace.llm_confidence, Some(0.85));
+    assert_eq!(
+        trace.llm_reasoning.as_deref(),
+        Some("Request asks for a mechanical code-format translation")
+    );
+    assert!(!trace.cache_hit);
+    assert_eq!(trace.llm_error, None);
+}
+
+#[tokio::test]
+async fn llm_fallback_returns_pass_through_when_llm_says_no() {
+    let client = MockLlmClient::with_responses([(
+        "explain why my coworker keeps disagreeing with me",
+        MockLlmResponse::Immediate(Ok(LlmClassification {
+            should_delegate: false,
+            confidence: 0.78,
+            reasoning: "Request is ambiguous and non-technical".to_string(),
+        })),
+    )]);
+    let classifier = LlmFallbackClassifier::new(client, llm_config(true));
+
+    let trace = classifier
+        .classify("explain why my coworker keeps disagreeing with me")
+        .await;
+
+    let ClassificationOutcome::PassThrough { reason, rule_name } = &trace.outcome else {
+        panic!("expected pass-through outcome");
+    };
+    assert_eq!(reason, "llm fallback");
+    assert_eq!(rule_name, &None);
+    assert_eq!(trace.llm_model.as_deref(), Some("gpt-5-mini"));
+    assert_eq!(trace.llm_confidence, Some(0.78));
+    assert_eq!(
+        trace.llm_reasoning.as_deref(),
+        Some("Request is ambiguous and non-technical")
+    );
+    assert!(!trace.cache_hit);
+    assert_eq!(trace.llm_error, None);
+}
+
+#[tokio::test]
+async fn llm_fallback_caches_result_for_repeat_intent() {
+    let client = MockLlmClient::with_responses([(
+        "convert this XML config to YAML format",
+        MockLlmResponse::Immediate(Ok(LlmClassification {
+            should_delegate: true,
+            confidence: 0.91,
+            reasoning: "Mechanical translation request".to_string(),
+        })),
+    )]);
+    let classifier = LlmFallbackClassifier::new(client.clone(), llm_config(true));
+
+    let first = classifier
+        .classify("convert this XML config to YAML format")
+        .await;
+    let second = classifier
+        .classify("convert this XML config to YAML format")
+        .await;
+
+    assert!(matches!(
+        first.outcome,
+        ClassificationOutcome::Delegate { .. }
+    ));
+    assert!(matches!(
+        second.outcome,
+        ClassificationOutcome::Delegate { .. }
+    ));
+    assert!(!first.cache_hit);
+    assert!(second.cache_hit);
+    assert_eq!(client.call_count(), 1);
+}
+
+#[tokio::test]
+async fn llm_fallback_returns_pass_through_when_disabled() {
+    let client = MockLlmClient::with_responses([]);
+    let classifier = LlmFallbackClassifier::new(client.clone(), llm_config(false));
+
+    let trace = classifier
+        .classify("convert this XML config to YAML format")
+        .await;
+
+    let ClassificationOutcome::PassThrough { reason, rule_name } = &trace.outcome else {
+        panic!("expected pass-through outcome");
+    };
+    assert_eq!(reason, "no rule matched + llm fallback unavailable");
+    assert_eq!(rule_name, &None);
+    assert_eq!(trace.llm_error.as_deref(), Some("llm fallback disabled"));
+    assert_eq!(trace.llm_model, None);
+    assert!(!trace.cache_hit);
+    assert_eq!(client.call_count(), 0);
+}
+
+#[tokio::test]
+async fn llm_fallback_returns_pass_through_on_timeout() {
+    let client = MockLlmClient::with_responses([(
+        "convert this XML config to YAML format",
+        MockLlmResponse::Delayed {
+            delay: Duration::from_millis(100),
+            result: Ok(LlmClassification {
+                should_delegate: true,
+                confidence: 0.9,
+                reasoning: "Too slow".to_string(),
+            }),
+        },
+    )]);
+    let classifier = LlmFallbackClassifier::new(client, llm_config(true));
+
+    let trace = classifier
+        .classify("convert this XML config to YAML format")
+        .await;
+
+    let ClassificationOutcome::PassThrough { reason, .. } = &trace.outcome else {
+        panic!("expected pass-through outcome");
+    };
+    assert_eq!(reason, "no rule matched + llm fallback unavailable");
+    assert!(
+        trace
+            .llm_error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out"))
+    );
+}
+
+#[tokio::test]
+async fn llm_fallback_returns_pass_through_on_invalid_json() {
+    let client = MockLlmClient::with_responses([(
+        "convert this XML config to YAML format",
+        MockLlmResponse::Immediate(Err(LlmError::InvalidJson(
+            "missing should_delegate".to_string(),
+        ))),
+    )]);
+    let classifier = LlmFallbackClassifier::new(client, llm_config(true));
+
+    let trace = classifier
+        .classify("convert this XML config to YAML format")
+        .await;
+
+    assert!(matches!(
+        trace.outcome,
+        ClassificationOutcome::PassThrough { .. }
+    ));
+    assert_eq!(
+        trace.llm_error.as_deref(),
+        Some("invalid JSON from llm fallback: missing should_delegate")
+    );
+}
+
+#[tokio::test]
+async fn llm_fallback_returns_pass_through_on_network_error() {
+    let client = MockLlmClient::with_responses([(
+        "convert this XML config to YAML format",
+        MockLlmResponse::Immediate(Err(LlmError::Transport("connection reset".to_string()))),
+    )]);
+    let classifier = LlmFallbackClassifier::new(client, llm_config(true));
+
+    let trace = classifier
+        .classify("convert this XML config to YAML format")
+        .await;
+
+    assert!(matches!(
+        trace.outcome,
+        ClassificationOutcome::PassThrough { .. }
+    ));
+    assert_eq!(
+        trace.llm_error.as_deref(),
+        Some("transport error: connection reset")
+    );
+}
+
+#[tokio::test]
+async fn cache_evicts_lru_at_capacity() {
+    let client = MockLlmClient::with_responses([
+        (
+            "first prompt",
+            MockLlmResponse::Immediate(Ok(LlmClassification {
+                should_delegate: true,
+                confidence: 0.8,
+                reasoning: "first".to_string(),
+            })),
+        ),
+        (
+            "second prompt",
+            MockLlmResponse::Immediate(Ok(LlmClassification {
+                should_delegate: false,
+                confidence: 0.7,
+                reasoning: "second".to_string(),
+            })),
+        ),
+        (
+            "first prompt",
+            MockLlmResponse::Immediate(Ok(LlmClassification {
+                should_delegate: true,
+                confidence: 0.82,
+                reasoning: "first again".to_string(),
+            })),
+        ),
+    ]);
+    let mut config = llm_config(true);
+    config.cache_size = 1;
+    let classifier = LlmFallbackClassifier::new(client.clone(), config);
+
+    let _ = classifier.classify("first prompt").await;
+    let _ = classifier.classify("second prompt").await;
+    let third = classifier.classify("first prompt").await;
+
+    assert!(!third.cache_hit);
+    assert_eq!(client.call_count(), 3);
+}
+
+#[tokio::test]
+async fn cache_does_not_persist_across_classifier_instances() {
+    let first_client = MockLlmClient::with_responses([(
+        "convert this XML config to YAML format",
+        MockLlmResponse::Immediate(Ok(LlmClassification {
+            should_delegate: true,
+            confidence: 0.83,
+            reasoning: "first instance".to_string(),
+        })),
+    )]);
+    let second_client = MockLlmClient::with_responses([(
+        "convert this XML config to YAML format",
+        MockLlmResponse::Immediate(Ok(LlmClassification {
+            should_delegate: true,
+            confidence: 0.84,
+            reasoning: "second instance".to_string(),
+        })),
+    )]);
+
+    let first = LlmFallbackClassifier::new(first_client.clone(), llm_config(true));
+    let second = LlmFallbackClassifier::new(second_client.clone(), llm_config(true));
+
+    let _ = first
+        .classify("convert this XML config to YAML format")
+        .await;
+    let second_trace = second
+        .classify("convert this XML config to YAML format")
+        .await;
+
+    assert!(!second_trace.cache_hit);
+    assert_eq!(first_client.call_count(), 1);
+    assert_eq!(second_client.call_count(), 1);
 }

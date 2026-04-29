@@ -6,6 +6,22 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::Deserialize;
 
+mod llm;
+
+pub use llm::ClassificationTrace;
+pub use llm::DEFAULT_LLM_FALLBACK_CACHE_SIZE;
+pub use llm::DEFAULT_LLM_FALLBACK_MODEL;
+pub use llm::DEFAULT_LLM_FALLBACK_PROVIDER;
+pub use llm::DEFAULT_LLM_FALLBACK_TIMEOUT;
+pub use llm::LlmClassification;
+pub use llm::LlmClient;
+pub use llm::LlmError;
+pub use llm::LlmFallbackClassifier;
+pub use llm::LlmFallbackConfig;
+pub use llm::OpenAiLlmClient;
+pub use llm::classify_with_fallback;
+pub use llm::load_openai_auth;
+
 use crate::ClassificationOutcome;
 use crate::Classifier;
 use crate::ClassifierError;
