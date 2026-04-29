@@ -50,3 +50,57 @@ pub enum SpecError {
     #[error("UtilRef.symbol must not be empty (entry #{0})")]
     EmptyUtilSymbol(usize),
 }
+
+#[derive(Debug, Error)]
+pub enum ClassifierError {
+    #[error("unsupported delegation_rules.toml version {found} (supported: 1)")]
+    UnsupportedRulesVersion { found: u32 },
+
+    #[error("delegation rule name must not be empty (rule #{index})")]
+    EmptyRuleName { index: usize },
+
+    #[error("delegation rule '{rule_name}' must contain at least one pattern")]
+    EmptyRulePatterns { rule_name: String },
+
+    #[error("rule '{rule_name}' uses unsupported action '{action}'")]
+    UnsupportedRuleAction { rule_name: String, action: String },
+
+    #[error("rule '{rule_name}' patterns[{index}] is not a valid regex: {source}")]
+    InvalidRulePattern {
+        rule_name: String,
+        index: usize,
+        #[source]
+        source: regex::Error,
+    },
+
+    #[error("failed to create classifier home directory {}: {source}", path.display())]
+    CreateRulesDir {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to write {}: {source}", path.display())]
+    WriteRulesFile {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to read {}: {source}", path.display())]
+    ReadRulesFile {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to parse {}: {source}", path.display())]
+    ParseRulesFile {
+        path: std::path::PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("failed to parse delegation_rules.toml: {0}")]
+    ParseRulesToml(#[source] toml::de::Error),
+}

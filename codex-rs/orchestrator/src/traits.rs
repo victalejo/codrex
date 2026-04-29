@@ -32,11 +32,20 @@ use crate::spec::DelegationSpec;
 pub enum ClassificationOutcome {
     /// Build a delegated turn from `spec`. The orchestrator hands this
     /// to a `DispatchSink`.
-    Delegate { spec: DelegationSpec },
+    Delegate {
+        spec: DelegationSpec,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_name: Option<String>,
+    },
     /// Don't delegate; run the prompt through the default agent path.
     /// The carrier `reason` is logged so we can later analyze why
     /// classification declined a delegation.
-    PassThrough { reason: String },
+    PassThrough {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_name: Option<String>,
+    },
 }
 
 /// Decides whether a user prompt should be delegated and, if so, with
@@ -206,9 +215,12 @@ mod tests {
         let cases = [
             ClassificationOutcome::Delegate {
                 spec: crate::DelegationSpec::new_bare("intent").unwrap(),
+                reason: "matched rule 'x'".into(),
+                rule_name: Some("x".into()),
             },
             ClassificationOutcome::PassThrough {
                 reason: "no rules matched".into(),
+                rule_name: None,
             },
         ];
         for case in cases {

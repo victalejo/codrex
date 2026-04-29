@@ -1,25 +1,28 @@
-//! `codrex orchestrate` subcommand — Phase 3 commit 3 happy path.
+//! `codrex orchestrate` subcommand — Phase 3 commit 6 rules classifier.
 //!
-//! User-facing entry into the orchestrator pipeline. Phase 3 LITE
-//! requires `--force-delegate` (or `--no-delegate`) — auto-classification
-//! arrives in commit 6.
+//! User-facing entry into the orchestrator pipeline. Phase 3 commit 6
+//! adds `RulesClassifier`, so unforced invocations classify the prompt
+//! against local delegation rules before deciding whether to delegate or
+//! pass through unchanged.
 //!
 //! Pipeline at this commit:
 //!
 //! ```text
-//!   build DelegationSpec from --force-delegate intent
+//!   classify prompt (flags override rules)
 //!     │
-//!     ▼  (log: classify, payload describes the force-delegate path)
-//!   MinimaxDispatchSink.dispatch
+//!     ├─ pass-through → log classify + decision → print prompt
+//!     │
+//!     └─ delegate → build DelegationSpec + apply CLI overrides
+//!                    │
+//!                    ▼  (log: classify with rule/override reason)
+//!                  MinimaxDispatchSink.dispatch
 //!     │
 //!     ▼  (log: dispatch.start, dispatch.end OR clarify on ClarificationRequested)
-//!   PlaceholderAuditor.audit  (always Ok in commit 3)
+//!   PatternAuditor.audit
 //!     │
 //!     ▼  (log: audit, decision)
 //!   print response_text to stdout
 //! ```
-//!
-//! Tool execution + real audit policy land in commits 4-5.
 //!
 //! Exit codes:
 //!   - `0`: final verdict `Ok`
@@ -31,12 +34,15 @@ use std::path::PathBuf;
 
 use clap::Args;
 use codex_orchestrator::AcceptanceCriterion;
+use codex_orchestrator::ClassificationOutcome;
+use codex_orchestrator::Classifier;
 use codex_orchestrator::DelegationContext;
 use codex_orchestrator::DelegationSpec;
 use codex_orchestrator::JsonlDecisionLog;
 use codex_orchestrator::MinimaxDispatchSink;
 use codex_orchestrator::OrchestrateOutcome;
 use codex_orchestrator::PatternAuditor;
+use codex_orchestrator::RulesClassifier;
 use codex_orchestrator::SpecError;
 use codex_orchestrator::TestSpec;
 use codex_orchestrator::run_orchestration_loop;
@@ -58,15 +64,13 @@ pub struct OrchestrateCli {
     pub prompt: String,
 
     /// Skip classification and force the prompt through the delegation
-    /// path. Required in Phase 3 commit 3 — `--no-delegate` is the only
-    /// other accepted control flag, and the auto classifier arrives in
-    /// commit 6.
+    /// path, even if the rules would normally pass it through.
     #[arg(long = "force-delegate", default_value_t = false, group = "classify")]
     pub force_delegate: bool,
 
     /// Skip the orchestrator entirely; the prompt is echoed unchanged.
-    /// Mutually exclusive with `--force-delegate`. Phase 3 has no
-    /// auto-classifier yet, so one of the two flags is required.
+    /// Mutually exclusive with `--force-delegate` and overrides any
+    /// delegation rule that would otherwise match.
     #[arg(long = "no-delegate", default_value_t = false, group = "classify")]
     pub no_delegate: bool,
 
@@ -106,12 +110,6 @@ pub struct OrchestrateCli {
 }
 
 pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<OrchestrateOutcome> {
-    if !cli.force_delegate && !cli.no_delegate {
-        anyhow::bail!(
-            "Phase 3 commit 3 requires one of `--force-delegate` or `--no-delegate`. \
-             Auto-classification arrives in commit 6."
-        );
-    }
     if cli.force_delegate && cli.no_delegate {
         anyhow::bail!("`--force-delegate` and `--no-delegate` are mutually exclusive.");
     }
@@ -119,50 +117,52 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<OrchestrateO
     let log = build_log(cli.log_dir.as_deref())?;
 
     if cli.no_delegate {
-        // Pass-through: echo the intent unchanged. Logged for symmetry
-        // so JSONL captures every orchestrate invocation, not only the
-        // delegation path. We still build a DelegationSpec so the run
-        // gets a real run_id (the spec auto-generates one); the
-        // dispatcher / auditor are skipped entirely.
-        let placeholder_spec = DelegationSpec::new_bare(&cli.prompt)?;
-        let ctx = DelegationContext::for_top_level(&placeholder_spec);
-        log.record(
-            &ctx,
-            LogStage::Classify,
-            serde_json::json!({"outcome": "pass_through", "reason": "user-forced (--no-delegate)"}),
+        return pass_through(
+            &cli.prompt,
+            "user-forced (--no-delegate)".to_string(),
+            None,
+            &log,
         )
         .await;
-        log.record(
-            &ctx,
-            LogStage::Decision,
-            serde_json::json!({
-                "verdict": "ok",
-                "rationale": "pass-through: prompt echoed without delegation"
-            }),
-        )
-        .await;
-        println!("{}", cli.prompt);
-        return Ok(OrchestrateOutcome::Ok {
-            response_text: cli.prompt,
-        });
     }
 
-    // Build the delegation spec. Phase 3 commit 4 surfaces forbidden
-    // patterns, output regex, and a test command via flags so manual
-    // E2E demos can exercise every audit code path. Auto-classification
-    // arrives in commit 6 and replaces these with rules-driven config.
-    let spec = build_delegation_spec(&cli)?;
-    let ctx = DelegationContext::for_top_level(&spec);
-    log.record(
-        &ctx,
-        LogStage::Classify,
-        serde_json::json!({
-            "outcome": "delegate",
-            "reason": "user-forced (--force-delegate)",
-            "intent": spec.intent,
-        }),
-    )
-    .await;
+    let spec = if cli.force_delegate {
+        let spec = build_delegation_spec(&cli)?;
+        log_classification(
+            &DelegationContext::for_top_level(&spec),
+            "delegate",
+            "user-forced (--force-delegate)".to_string(),
+            None,
+            &log,
+        )
+        .await;
+        spec
+    } else {
+        let codex_home = codex_utils_home_dir::find_codex_home()
+            .map_err(|e| anyhow::anyhow!("failed to resolve CODREX_HOME: {e}"))?;
+        let classifier = RulesClassifier::from_default_path(codex_home.as_path())?;
+        match classifier.classify(&cli.prompt).await {
+            ClassificationOutcome::Delegate {
+                spec,
+                reason,
+                rule_name,
+            } => {
+                let spec = build_delegation_spec_from_base(spec, &cli)?;
+                log_classification(
+                    &DelegationContext::for_top_level(&spec),
+                    "delegate",
+                    reason,
+                    rule_name,
+                    &log,
+                )
+                .await;
+                spec
+            }
+            ClassificationOutcome::PassThrough { reason, rule_name } => {
+                return pass_through(&cli.prompt, reason, rule_name, &log).await;
+            }
+        }
+    };
 
     let sink = MinimaxDispatchSink::new(&cli.model);
     let auditor = PatternAuditor::new();
@@ -198,13 +198,32 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<OrchestrateO
     Ok(outcome)
 }
 
+fn build_log(custom_dir: Option<&std::path::Path>) -> anyhow::Result<JsonlDecisionLog> {
+    let dir = match custom_dir {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let home = codex_utils_home_dir::find_codex_home()
+                .map_err(|e| anyhow::anyhow!("failed to resolve CODREX_HOME: {e}"))?;
+            home.as_path().join("runs")
+        }
+    };
+    Ok(JsonlDecisionLog::new(dir))
+}
+
 fn build_delegation_spec(cli: &OrchestrateCli) -> anyhow::Result<DelegationSpec> {
-    let mut spec = DelegationSpec::new_bare(&cli.prompt)?;
-    spec.set_forbidden_patterns(cli.forbidden.clone())
-        .map_err(|e| anyhow::anyhow!("invalid spec built from flags: {e}"))?;
+    build_delegation_spec_from_base(DelegationSpec::new_bare(&cli.prompt)?, cli)
+}
+
+fn build_delegation_spec_from_base(
+    mut spec: DelegationSpec,
+    cli: &OrchestrateCli,
+) -> anyhow::Result<DelegationSpec> {
     if let Some(max_retries) = cli.max_retries {
         spec.max_retries = max_retries;
     }
+    spec.set_forbidden_patterns(cli.forbidden.clone())
+        .map_err(|e| anyhow::anyhow!("invalid spec built from flags: {e}"))?;
+
     let mut acceptance: Vec<AcceptanceCriterion> = Vec::new();
     if !cli.forbidden.is_empty() {
         acceptance.push(AcceptanceCriterion::NoForbiddenPatterns);
@@ -236,16 +255,54 @@ fn build_delegation_spec(cli: &OrchestrateCli) -> anyhow::Result<DelegationSpec>
     Ok(spec)
 }
 
-fn build_log(custom_dir: Option<&std::path::Path>) -> anyhow::Result<JsonlDecisionLog> {
-    let dir = match custom_dir {
-        Some(p) => p.to_path_buf(),
-        None => {
-            let home = codex_utils_home_dir::find_codex_home()
-                .map_err(|e| anyhow::anyhow!("failed to resolve CODREX_HOME: {e}"))?;
-            home.as_path().join("runs")
-        }
-    };
-    Ok(JsonlDecisionLog::new(dir))
+async fn pass_through(
+    prompt: &str,
+    reason: String,
+    rule_name: Option<String>,
+    log: &JsonlDecisionLog,
+) -> anyhow::Result<OrchestrateOutcome> {
+    // Pass-through: echo the intent unchanged. Logged for symmetry so
+    // JSONL captures every orchestrate invocation, not only the
+    // delegation path. We still build a DelegationSpec so the run gets
+    // a real run_id; the dispatcher and auditor are skipped entirely.
+    let placeholder_spec = DelegationSpec::new_bare(prompt)?;
+    let ctx = DelegationContext::for_top_level(&placeholder_spec);
+    log_classification(&ctx, "pass_through", reason.clone(), rule_name, log).await;
+    log.record(
+        &ctx,
+        LogStage::Decision,
+        serde_json::json!({
+            "verdict": "ok",
+            "rationale": format!("pass-through: {reason}")
+        }),
+    )
+    .await;
+    println!("{prompt}");
+    Ok(OrchestrateOutcome::Ok {
+        response_text: prompt.to_string(),
+    })
+}
+
+async fn log_classification(
+    ctx: &DelegationContext,
+    outcome: &str,
+    reason: String,
+    rule_name: Option<String>,
+    log: &JsonlDecisionLog,
+) {
+    let mut payload = serde_json::json!({
+        "outcome": outcome,
+        "reason": reason,
+    });
+    if let Some(rule_name) = rule_name
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert(
+            "rule_name".to_string(),
+            serde_json::Value::String(rule_name),
+        );
+    }
+    log.record(ctx, LogStage::Classify, payload).await;
 }
 
 #[cfg(test)]

@@ -45,6 +45,7 @@
 //! [`orch_debug_enabled`].
 
 pub mod audit;
+pub mod classifier;
 pub mod context;
 pub mod decision;
 pub mod dispatch;
@@ -56,9 +57,13 @@ pub mod traits;
 
 pub use audit::PatternAuditor;
 pub use audit::PlaceholderAuditor;
+pub use classifier::Rule;
+pub use classifier::RuleAction;
+pub use classifier::RulesClassifier;
 pub use context::DelegationContext;
 pub use decision::AuditDecision;
 pub use dispatch::MinimaxDispatchSink;
+pub use error::ClassifierError;
 pub use error::SpecError;
 pub use log::Clock;
 pub use log::InMemoryDecisionLog;
@@ -71,6 +76,7 @@ pub use spec::DelegationSpec;
 pub use spec::ScriptRef;
 pub use spec::TestSpec;
 pub use spec::UtilRef;
+pub use spec::ValidatedRegex;
 pub use traits::AuditReport;
 pub use traits::Auditor;
 pub use traits::ClassificationOutcome;
