@@ -1192,12 +1192,16 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 run_execpolicycheck(cmd)?
             }
         },
-        Some(Subcommand::Orchestrate(orch_cli)) => {
+        Some(Subcommand::Orchestrate(mut orch_cli)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
                 root_remote_auth_token_env.as_deref(),
                 "orchestrate",
             )?;
+            prepend_config_flags(
+                &mut orch_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
             let outcome = orchestrate_cmd::run_orchestrate(orch_cli).await?;
             if outcome.exit_code() != 0 {
                 std::process::exit(i32::from(outcome.exit_code()));

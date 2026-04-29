@@ -967,6 +967,37 @@
         }
       ]
     },
+    "LlmFallbackConfigToml": {
+      "additionalProperties": false,
+      "description": "Settings for the rules-miss LLM fallback classifier.",
+      "properties": {
+        "cache_size": {
+          "description": "In-memory per-process LRU cache capacity for exact-intent matches.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "enabled": {
+          "description": "Explicitly enable or disable the rules-miss LLM fallback.",
+          "type": "boolean"
+        },
+        "model": {
+          "description": "Model used for the binary delegate/pass-through classification prompt.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "Provider identifier. Commit 7 supports only `\"openai\"`.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Max wall-clock wait for the fallback request, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "MarketplaceConfig": {
       "additionalProperties": false,
       "properties": {
@@ -1504,6 +1535,21 @@
           "type": "string"
         }
       ]
+    },
+    "OrchestratorConfigToml": {
+      "additionalProperties": false,
+      "description": "Orchestrator-specific settings loaded from `config.toml`.",
+      "properties": {
+        "llm_fallback": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/LlmFallbackConfigToml"
+            }
+          ],
+          "description": "Optional settings for the commit-7 LLM fallback classifier."
+        }
+      },
+      "type": "object"
     },
     "OtelConfigToml": {
       "additionalProperties": false,
@@ -2995,6 +3041,14 @@
     "openai_base_url": {
       "description": "Base URL override for the built-in `openai` model provider.",
       "type": "string"
+    },
+    "orchestrator": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/OrchestratorConfigToml"
+        }
+      ],
+      "description": "Settings specific to the Phase 3 orchestrator pipeline."
     },
     "oss_provider": {
       "description": "Preferred OSS provider for local models, e.g. \"lmstudio\" or \"ollama\".",

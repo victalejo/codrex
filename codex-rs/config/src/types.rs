@@ -159,6 +159,30 @@ pub struct FeedbackConfigToml {
     pub enabled: Option<bool>,
 }
 
+/// Orchestrator-specific settings loaded from `config.toml`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct OrchestratorConfigToml {
+    /// Optional settings for the commit-7 LLM fallback classifier.
+    pub llm_fallback: Option<LlmFallbackConfigToml>,
+}
+
+/// Settings for the rules-miss LLM fallback classifier.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct LlmFallbackConfigToml {
+    /// Explicitly enable or disable the rules-miss LLM fallback.
+    pub enabled: Option<bool>,
+    /// Provider identifier. Commit 7 supports only `"openai"`.
+    pub provider: Option<String>,
+    /// Model used for the binary delegate/pass-through classification prompt.
+    pub model: Option<String>,
+    /// Max wall-clock wait for the fallback request, in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// In-memory per-process LRU cache capacity for exact-intent matches.
+    pub cache_size: Option<usize>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSuggestDiscoverableType {

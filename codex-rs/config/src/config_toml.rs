@@ -18,6 +18,7 @@ use crate::types::McpServerConfig;
 use crate::types::MemoriesToml;
 use crate::types::Notice;
 use crate::types::OAuthCredentialsStoreMode;
+use crate::types::OrchestratorConfigToml;
 use crate::types::OtelConfigToml;
 use crate::types::PluginConfig;
 use crate::types::SandboxWorkspaceWrite;
@@ -249,6 +250,9 @@ pub struct ConfigToml {
 
     /// Collection of settings that are specific to the TUI.
     pub tui: Option<Tui>,
+
+    /// Settings specific to the Phase 3 orchestrator pipeline.
+    pub orchestrator: Option<OrchestratorConfigToml>,
 
     /// When set to `true`, `AgentReasoning` events will be hidden from the
     /// UI/output. Defaults to `false`.
