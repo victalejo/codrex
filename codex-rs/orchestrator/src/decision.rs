@@ -151,6 +151,15 @@ impl CriterionKind {
     }
 }
 
+/// Computes a signature over all failed criteria, sorted by individual
+/// signature to ensure order-invariance.
+///
+/// NOTE: As of Phase 3, `PatternAuditor` short-circuits on first failure,
+/// so `RetryFeedback` always contains exactly 1 `FailedCriterion`. The
+/// sorted-aggregate logic is forward-compatible with future auditors that
+/// may report multiple failures, for example a non-short-circuit mode for
+/// "show all problems at once" UX. Tests `feedback_signature_*` cover the
+/// multi-criterion case at unit level.
 pub fn error_signature_for_retry_feedback(feedback: &RetryFeedback) -> Option<String> {
     if feedback.failed_criteria.is_empty() {
         return None;
