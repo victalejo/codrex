@@ -79,6 +79,11 @@ pub struct OrchestrateCli {
     #[arg(long)]
     pub log_dir: Option<PathBuf>,
 
+    /// Maximum retry attempts on `AuditDecision::Retry` before
+    /// escalating. Default 2 (set by `DelegationSpec`), capped at 10.
+    #[arg(long = "max-retries")]
+    pub max_retries: Option<u8>,
+
     /// Regex pattern the response must NOT match. Repeatable. Adds the
     /// pattern to `DelegationSpec.forbidden_patterns` and implicitly
     /// adds an `AcceptanceCriterion::NoForbiddenPatterns` (idempotent).
@@ -98,11 +103,6 @@ pub struct OrchestrateCli {
     /// for that.
     #[arg(long = "require-tests-cmd")]
     pub require_tests_cmd: Option<String>,
-
-    /// Maximum retry attempts on AuditDecision::Retry before
-    /// escalating. Default 2 (set by DelegationSpec), capped at 10.
-    #[arg(long = "max-retries")]
-    pub max_retries: Option<u8>,
 }
 
 pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<OrchestrateOutcome> {
@@ -251,39 +251,41 @@ fn build_log(custom_dir: Option<&std::path::Path>) -> anyhow::Result<JsonlDecisi
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use pretty_assertions::assert_eq;
 
-    use super::*;
+    use super::OrchestrateCli;
+    use super::build_delegation_spec;
+    use codex_orchestrator::DelegationSpec;
 
     #[derive(Debug, Parser)]
-    struct TestCli {
+    struct ParsedOrchestrateCli {
         #[command(flatten)]
-        orchestrate: OrchestrateCli,
+        cli: OrchestrateCli,
+    }
+
+    fn parse_cli(args: &[&str]) -> OrchestrateCli {
+        ParsedOrchestrateCli::try_parse_from(args)
+            .expect("orchestrate args should parse")
+            .cli
     }
 
     #[test]
-    fn max_retries_flag_overrides_delegation_spec() {
-        let cli = TestCli::parse_from([
-            "codrex",
-            "do work",
-            "--force-delegate",
-            "--max-retries",
-            "5",
-        ])
-        .orchestrate;
+    fn build_spec_uses_max_retries_from_flag() {
+        let cli = parse_cli(&["codrex", "prompt", "--force-delegate", "--max-retries", "5"]);
 
-        let spec = build_delegation_spec(&cli).expect("spec should build from CLI");
+        let spec = build_delegation_spec(&cli).expect("spec should build");
 
         assert_eq!(spec.max_retries, 5);
     }
 
     #[test]
-    fn max_retries_defaults_to_delegation_spec_default_when_flag_absent() {
-        let cli = TestCli::parse_from(["codrex", "do work", "--force-delegate"]).orchestrate;
+    fn build_spec_keeps_default_max_retries_without_flag() {
+        let cli = parse_cli(&["codrex", "prompt", "--force-delegate"]);
 
-        let spec = build_delegation_spec(&cli).expect("spec should build from CLI");
+        let spec = build_delegation_spec(&cli).expect("spec should build");
+        let default_spec =
+            DelegationSpec::new_bare("prompt").expect("bare spec should use the default retries");
 
-        // DEFAULT_MAX_RETRIES is private in codex-orchestrator; keep this
-        // aligned with DelegationSpec::new_bare's documented default.
-        assert_eq!(spec.max_retries, 2);
+        assert_eq!(spec.max_retries, default_spec.max_retries);
     }
 }
