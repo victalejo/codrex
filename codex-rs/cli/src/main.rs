@@ -179,7 +179,7 @@ enum Subcommand {
     /// Runs the prompt through the orchestrator pipeline (classify →
     /// dispatch → audit → log). Supports retry loops with error-signature
     /// deduplication and max-retries escalation. Exit codes: 0=Ok,
-    /// 1=infra error, 2=Escalate, 3=Drop.
+    /// 1=infra error, 2=Escalate, 3=Drop, 4=Clarify.
     #[clap(visible_alias = "o")]
     Orchestrate(orchestrate_cmd::OrchestrateCli),
 }

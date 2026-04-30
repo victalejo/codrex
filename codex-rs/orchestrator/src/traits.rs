@@ -95,8 +95,9 @@ pub enum DispatchError {
     #[error("transport error: {0}")]
     Transport(String),
     /// The model returned a `CLARIFY: ...` prefixed response asking for
-    /// disambiguation. Phase 3 commits 3-7 surface this as a non-zero
-    /// exit; commit 8 implements the round-trip.
+    /// disambiguation. Phase 3 commit 8 surfaces this as a stateless
+    /// round-trip: the user re-runs `codrex orchestrate` with a refined
+    /// prompt that includes the answer.
     #[error("model requested clarification: {question}")]
     ClarificationRequested { question: String },
 }

@@ -176,6 +176,31 @@ no debería salir sin esto).
 - **Bloqueante de:** ninguno; legibilidad solamente.
 - **Estimado:** 15 minutos.
 
+## 18. Guardrail de verificación manual para `codex-cli` (Fase 3 commit 8)
+
+- **Origen:** auditoría de commit 7/8 (2026-04-30).
+- **Disparador:** commit 9 (`docs/orchestrator.md`) o la próxima guía de
+  verificación manual del orquestador.
+- **Scope:** documentar explícitamente que `cargo test -p codex-orchestrator`
+  valida la librería, pero las corridas E2E del subcomando requieren rebuild
+  separado del binario con `cargo build -p codex-cli --bin codrex` y chequeo
+  de timestamp/binario actualizado antes de correr `./target/debug/codrex ...`.
+- **Bloqueante de:** ninguno; reduce falsos verdes en auditorías manuales.
+- **Estimado:** 15-30 minutos.
+
+## 19. Round-trip stateful para `CLARIFY` (Phase 4)
+
+- **Origen:** diseño de commit 8 (2026-04-30).
+- **Disparador:** cuando queramos que una aclaración continúe el flujo sin
+  obligar al usuario a reformular manualmente el prompt.
+- **Scope:** diseñar un mecanismo stateful (`codrex orchestrate --resume
+  <session_id> ...` o integración con `codrex resume`) que recupere el contexto
+  del run original, inyecte la respuesta del usuario y reanude la delegación.
+- **Bloqueante de:** ninguno en Phase 3; mejora de UX para Phase 4.
+- **Riesgo:** medio, porque toca persistencia/identidad de runs y semántica de
+  reanudación.
+- **Estimado:** 0.5-1 día con tests y docs.
+
 ## 10. `TestSpec` LITE extensions (Fase 3 commit 1)
 
 - **Origen:** Fase 3 commit 1 (`codex-rs/orchestrator/src/spec.rs`).

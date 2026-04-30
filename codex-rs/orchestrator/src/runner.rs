@@ -19,11 +19,15 @@ use crate::traits::DispatchSink;
 use crate::traits::LogStage;
 
 const REPEATED_ERROR_LOOP_THRESHOLD: u8 = 2;
+const CLARIFY_RATIONALE: &str = "model requested clarification before generating output";
 
 #[derive(Debug, Clone)]
 pub enum OrchestrateOutcome {
     Ok {
         response_text: String,
+    },
+    Clarify {
+        question: String,
     },
     Escalate {
         reason: String,
@@ -40,18 +44,33 @@ impl OrchestrateOutcome {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Ok { .. } => 0,
+            Self::Clarify { .. } => 4,
             Self::Escalate { .. } => 2,
             Self::Drop { .. } => 3,
         }
     }
 }
 
+fn clarify_decision_payload(question: &str) -> serde_json::Value {
+    let mut payload = serde_json::to_value(AuditDecision::Clarify {
+        question: question.to_string(),
+    })
+    .expect("clarify decision should serialize");
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "rationale".to_string(),
+            serde_json::Value::String(CLARIFY_RATIONALE.to_string()),
+        );
+    }
+    payload
+}
+
 pub async fn run_orchestration_loop(
     spec: &DelegationSpec,
     model: &str,
-    sink: &(impl DispatchSink + Send + Sync),
-    auditor: &(impl Auditor + Send + Sync),
-    log: &(impl DecisionLog + Send + Sync),
+    sink: &impl DispatchSink,
+    auditor: &impl Auditor,
+    log: &impl DecisionLog,
 ) -> std::result::Result<OrchestrateOutcome, String> {
     let mut ctx = DelegationContext::for_top_level(spec);
     let mut repeated_signature: Option<String> = None;
@@ -77,18 +96,10 @@ pub async fn run_orchestration_loop(
                 log.record(
                     &ctx,
                     LogStage::Decision,
-                    serde_json::json!({
-                        "verdict": "escalate",
-                        "reason": "model requested clarification",
-                        "blocking_issue": question,
-                    }),
+                    clarify_decision_payload(&question),
                 )
                 .await;
-                return Ok(OrchestrateOutcome::Escalate {
-                    reason: "model requested clarification".to_string(),
-                    blocking_issue: question,
-                    attempts_exhausted: None,
-                });
+                return Ok(OrchestrateOutcome::Clarify { question });
             }
             Err(other) => {
                 log.record(
@@ -164,6 +175,15 @@ pub async fn run_orchestration_loop(
                     blocking_issue,
                     attempts_exhausted: None,
                 });
+            }
+            AuditDecision::Clarify { question } => {
+                log.record(
+                    &ctx,
+                    LogStage::Decision,
+                    clarify_decision_payload(&question),
+                )
+                .await;
+                return Ok(OrchestrateOutcome::Clarify { question });
             }
             AuditDecision::Drop { reason } => {
                 log.record(
@@ -257,9 +277,11 @@ pub async fn run_orchestration_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AcceptanceCriterion, DelegationSpec, InMemoryDecisionLog, LogStage, PatternAuditor,
-    };
+    use crate::AcceptanceCriterion;
+    use crate::DelegationSpec;
+    use crate::InMemoryDecisionLog;
+    use crate::LogStage;
+    use crate::PatternAuditor;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
@@ -297,7 +319,7 @@ mod tests {
         let requests_seen = Arc::new(AtomicUsize::new(0));
         let responses: Vec<String> = responses
             .iter()
-            .map(|response| response.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         let expected_markers: Vec<Option<String>> = expected_markers
             .iter()
@@ -499,6 +521,86 @@ mod tests {
             event.stage == LogStage::Decision
                 && event.payload["verdict"] == "escalate"
                 && event.payload["reason"].as_str().is_some()
+        }));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env_minimax)]
+    async fn clarify_response_yields_clarify_outcome() {
+        let spec = DelegationSpec::new_bare("implement validate_email").unwrap();
+        let question = "should I use regex or a parser?";
+
+        let (outcome, events) =
+            run_with_mocked_minimax(spec, &[&format!("CLARIFY: {question}")], &[None]).await;
+
+        let OrchestrateOutcome::Clarify {
+            question: outcome_question,
+        } = outcome
+        else {
+            panic!("expected clarify outcome");
+        };
+        assert_eq!(outcome_question, question);
+        assert_eq!(
+            OrchestrateOutcome::Clarify {
+                question: outcome_question,
+            }
+            .exit_code(),
+            4
+        );
+
+        let decision_event = events
+            .iter()
+            .find(|event| event.stage == LogStage::Decision)
+            .expect("decision event should exist");
+        let decision: crate::AuditDecision =
+            serde_json::from_value(decision_event.payload.clone()).expect("decision should parse");
+        assert_eq!(
+            decision,
+            crate::AuditDecision::Clarify {
+                question: question.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env_minimax)]
+    async fn clarify_logs_distinctive_verdict() {
+        let spec = DelegationSpec::new_bare("implement validate_email").unwrap();
+        let question = "should I use regex or a parser?";
+
+        let (_outcome, events) =
+            run_with_mocked_minimax(spec, &[&format!("CLARIFY: {question}")], &[None]).await;
+
+        let decision_event = events
+            .iter()
+            .find(|event| event.stage == LogStage::Decision)
+            .expect("decision event should exist");
+        assert_eq!(decision_event.payload["verdict"], "clarify");
+        assert_eq!(decision_event.payload["question"], question);
+        assert_eq!(
+            decision_event.payload["rationale"],
+            "model requested clarification before generating output"
+        );
+        assert_ne!(decision_event.payload["verdict"], "escalate");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env_minimax)]
+    async fn clarify_does_not_invoke_audit_or_retry() {
+        let spec = DelegationSpec::new_bare("implement validate_email").unwrap();
+
+        let (_outcome, events) =
+            run_with_mocked_minimax(spec, &["CLARIFY: should I use regex or a parser?"], &[None])
+                .await;
+
+        assert!(!events.iter().any(|event| event.stage == LogStage::Audit));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.stage == LogStage::AuditCriterion)
+        );
+        assert!(!events.iter().any(|event| {
+            event.stage == LogStage::Decision && event.payload["verdict"] == "retry"
         }));
     }
 }

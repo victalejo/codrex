@@ -44,6 +44,10 @@ pub enum AuditDecision {
         blocking_issue: String,
     },
 
+    /// The model asked the user to clarify the request before it could
+    /// safely generate code.
+    Clarify { question: String },
+
     /// The output is unsalvageable (response was empty, dispatch
     /// errored before a real response, the spec was invalid retroactively).
     /// Log and abort silently — no user input expected.
@@ -112,7 +116,7 @@ impl FailedCriterion {
 }
 
 fn normalize_signature_excerpt(input: &str) -> String {
-    let normalized = input.replace('\n', " ").replace('\r', " ");
+    let normalized = input.replace(['\n', '\r'], " ");
     let normalized = normalize_signature_paths(&normalized);
     let normalized = normalize_signature_noise(&normalized);
     normalized.chars().take(SIGNATURE_PREVIEW_LIMIT).collect()
@@ -214,7 +218,7 @@ impl AuditDecision {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Ok { .. } | Self::Escalate { .. } | Self::Drop { .. }
+            Self::Ok { .. } | Self::Escalate { .. } | Self::Clarify { .. } | Self::Drop { .. }
         )
     }
 }
@@ -266,6 +270,9 @@ mod tests {
             AuditDecision::Escalate {
                 reason: "matched forbidden pattern".into(),
                 blocking_issue: "response uses `unsafe`".into(),
+            },
+            AuditDecision::Clarify {
+                question: "should I use regex or a parser?".into(),
             },
             AuditDecision::Drop {
                 reason: "MiniMax returned empty body".into(),
@@ -363,7 +370,7 @@ mod tests {
         );
         let sig1 = c1.error_signature();
         let sig2 = c2.error_signature();
-        let mut sorted_sigs = vec![sig1, sig2];
+        let mut sorted_sigs = [sig1, sig2];
         sorted_sigs.sort();
         let expected_combined = sorted_sigs.join("|");
         let mut hasher = sha2::Sha256::new();
@@ -450,6 +457,12 @@ mod tests {
             AuditDecision::Escalate {
                 reason: "x".into(),
                 blocking_issue: "y".into()
+            }
+            .is_terminal()
+        );
+        assert!(
+            AuditDecision::Clarify {
+                question: "which language?".into()
             }
             .is_terminal()
         );

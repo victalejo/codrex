@@ -29,7 +29,9 @@
 //!   - `1`: infrastructure/dispatch error (auth, transport, parser, etc.)
 //!   - `2`: final verdict `Escalate` (needs user intervention)
 //!   - `3`: final verdict `Drop`
+//!   - `4`: final verdict `Clarify` (re-run with a refined prompt)
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,7 +94,8 @@ Exit codes:
   0 — final verdict Ok (response accepted)
   1 — infrastructure/dispatch error (auth failure, transport error, etc.)
   2 — final verdict Escalate (needs user intervention)
-  3 — final verdict Drop (loop detected or unrecoverable)"]
+  3 — final verdict Drop (loop detected or unrecoverable)
+  4 — final verdict Clarify (re-run with a refined prompt)"]
 pub struct OrchestrateCli {
     #[clap(flatten)]
     pub config_overrides: CliConfigOverrides,
@@ -186,6 +189,11 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<OrchestrateO
         OrchestrateOutcome::Ok { response_text } => {
             println!("{response_text}");
         }
+        OrchestrateOutcome::Clarify { question } => {
+            let mut stdout = std::io::stdout();
+            let mut stderr = std::io::stderr();
+            write_clarify_output(&mut stdout, &mut stderr, question)?;
+        }
         OrchestrateOutcome::Escalate {
             reason,
             blocking_issue,
@@ -209,6 +217,20 @@ pub async fn run_orchestrate(cli: OrchestrateCli) -> anyhow::Result<OrchestrateO
     }
 
     Ok(outcome)
+}
+
+fn write_clarify_output(
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    question: &str,
+) -> std::io::Result<()> {
+    write!(stdout, "{question}")?;
+    stdout.flush()?;
+    writeln!(
+        stderr,
+        "The model needs clarification before generating code:\n\n  Q: {question}\n\nTo proceed, re-run `codrex orchestrate` with the answer\nincorporated into your prompt. For example:\n\n  Original: codrex orchestrate \"implement validate_email\"\n  Refined:  codrex orchestrate \"implement validate_email using regex,\n            returning bool, no external dependencies\""
+    )?;
+    stderr.flush()
 }
 
 struct DisabledRulesClassifier;
@@ -581,6 +603,7 @@ mod tests {
     use super::OrchestrateCli;
     use super::build_delegation_spec;
     use super::classify_from_cli;
+    use super::write_clarify_output;
     use codex_orchestrator::DelegationSpec;
 
     #[derive(Debug, Parser)]
@@ -832,5 +855,30 @@ mod tests {
         assert_eq!(trace.reason(), "llm fallback");
         assert_eq!(rules.call_count(), 1);
         assert_eq!(llm_client.call_count(), 1);
+    }
+
+    #[test]
+    fn clarify_message_to_stderr_includes_framing() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        write_clarify_output(&mut stdout, &mut stderr, "should I use regex or a parser?")
+            .expect("clarify output should write");
+
+        let rendered = String::from_utf8(stderr).expect("stderr should be utf8");
+        assert!(rendered.contains("The model needs clarification before generating code:"));
+        assert!(rendered.contains("Q: should I use regex or a parser?"));
+        assert!(rendered.contains("Original:"));
+        assert!(rendered.contains("Refined:"));
+    }
+
+    #[test]
+    fn clarify_question_to_stdout_is_clean() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        write_clarify_output(&mut stdout, &mut stderr, "should I use regex or a parser?")
+            .expect("clarify output should write");
+
+        let rendered = String::from_utf8(stdout).expect("stdout should be utf8");
+        assert_eq!(rendered, "should I use regex or a parser?");
     }
 }
