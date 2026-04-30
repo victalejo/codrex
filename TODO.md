@@ -241,6 +241,48 @@ no debería salir sin esto).
 - **Bloqueante de:** ninguno funcional; reduce falsos verdes en auditorías.
 - **Estimado:** 15-30 minutos (doc + helper opcional).
 
+## 22. `app-server::tracing_tests` consume >2 MB de stack en debug build (Fase 3 commit 9a)
+
+- **Origen:** descubierto en commit 9a (2026-04-30) tras fixear el primer
+  bug de WireApi exhaustiveness — `cargo test --workspace` ya compilaba
+  pero el test
+  `message_processor::tracing_tests::turn_start_jsonrpc_span_parents_core_turn_spans`
+  desbordaba el stack default de tokio current_thread (~2 MB) y abortaba
+  el process completo (SIGABRT).
+- **Threshold empírico:** el test pasa con `RUST_MIN_STACK=4194304` (4 MB),
+  falla con el default de ~2 MB. No hay recursión genuina; es consumption
+  alto en debug build (unoptimized frames + tracing instrumentation +
+  futures anidados de tokio).
+- **Procedencia:** 100% upstream. Los últimos commits sobre el archivo
+  son `ac2bffa44 test: harden app-server integration tests (#19683)` y
+  `9c3abcd46 [codex] Move config loading into codex-config (#19487)`.
+  No tocamos el crate `codex-app-server` en Codrex.
+- **Por qué fue invisible hasta hoy:** el bug de WireApi exhaustiveness
+  rompía la compilación de `codex-config` bajo `cfg(test)`, y el dep
+  graph `codex-app-server → codex-config` impedía llegar al runtime
+  del test ofensor. Tras el fix `178efda7c`, el overflow afloró.
+- **Workaround actual:** `RUST_MIN_STACK = "8388608"` en
+  `codex-rs/.cargo/config.toml` `[env]` block. 8 MB para igualar el
+  workaround `link-arg=/STACK:8388608` que upstream ya tiene en
+  Windows. Mantiene cobertura del test (no `#[ignore]`).
+- **Disparador para fix definitivo:** próximo merge de upstream que
+  toque `tracing_tests.rs` o el `.cargo/config.toml`, o reporte de
+  fricción con el workaround.
+- **Posibles fixes definitivos (futuros):**
+  - Reducir profundidad de spans en el test `turn_start_jsonrpc_span_parents_core_turn_spans`.
+  - Optimizar instrumentación de tracing en `app-server` para que no
+    infle frames en debug builds.
+  - Abrir PR upstream sugiriendo bump de stack default a través del
+    mismo mecanismo.
+- **Bloqueante de:** ninguno. Workaround in-repo deja `cargo test
+  --workspace` verde.
+- **Riesgo:** bajo. El env var es benigno y el comentario in-config
+  explica el porqué.
+- **Mantenimiento:** sync con `.cargo/config.toml` upstream cuando
+  hagamos merge; el conflict, si aparece, es obvio.
+- **Estimado para fix definitivo:** depende del approach (reducir spans:
+  1-2h; PR upstream: variable según ciclo de review).
+
 ## 10. `TestSpec` LITE extensions (Fase 3 commit 1)
 
 - **Origen:** Fase 3 commit 1 (`codex-rs/orchestrator/src/spec.rs`).
