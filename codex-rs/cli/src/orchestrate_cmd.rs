@@ -56,6 +56,7 @@ use codex_orchestrator::LlmClient;
 use codex_orchestrator::LlmFallbackClassifier;
 use codex_orchestrator::LlmFallbackConfig;
 use codex_orchestrator::MinimaxDispatchSink;
+use codex_orchestrator::OpenAiFallbackAvailability;
 use codex_orchestrator::OpenAiLlmClient;
 use codex_orchestrator::OrchestrateOutcome;
 use codex_orchestrator::PatternAuditor;
@@ -64,6 +65,8 @@ use codex_orchestrator::SpecError;
 use codex_orchestrator::TestSpec;
 use codex_orchestrator::classify_with_fallback;
 use codex_orchestrator::load_openai_auth;
+use codex_orchestrator::openai_fallback_availability;
+use codex_orchestrator::resolve_llm_fallback_model;
 use codex_orchestrator::run_orchestration_loop;
 use codex_orchestrator::traits::DecisionLog;
 use codex_orchestrator::traits::LogStage;
@@ -77,6 +80,7 @@ struct OrchestrateRuntimeConfig {
     codex_home: PathBuf,
     cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
     llm_fallback: LlmFallbackConfig,
+    llm_fallback_configured_model: Option<String>,
 }
 
 struct DisabledLlmClient;
@@ -343,6 +347,11 @@ async fn load_runtime_config(cli: &OrchestrateCli) -> anyhow::Result<Orchestrate
                 .unwrap_or(DEFAULT_LLM_FALLBACK_CACHE_SIZE),
             enabled: configured_llm_fallback_enabled(&config_toml, cli),
         },
+        llm_fallback_configured_model: config_toml
+            .orchestrator
+            .as_ref()
+            .and_then(|config| config.llm_fallback.as_ref())
+            .and_then(|config| config.model.clone()),
     })
 }
 
@@ -366,6 +375,27 @@ fn build_llm_fallback_classifier(
         runtime.cli_auth_credentials_store_mode,
     ) {
         Ok(Some(auth)) => {
+            match openai_fallback_availability(Some(&auth)) {
+                OpenAiFallbackAvailability::Enabled => {}
+                OpenAiFallbackAvailability::DisabledByChatgptAuth => {
+                    config.enabled = false;
+                    return Ok(
+                        LlmFallbackClassifier::new(Arc::new(DisabledLlmClient), config)
+                            .with_chatgpt_auth_disabled(),
+                    );
+                }
+                OpenAiFallbackAvailability::Unavailable => {
+                    config.enabled = false;
+                    return Ok(
+                        LlmFallbackClassifier::new(Arc::new(DisabledLlmClient), config)
+                            .with_disabled_reason("no openai credentials configured"),
+                    );
+                }
+            }
+            config.model = resolve_llm_fallback_model(
+                runtime.llm_fallback_configured_model.as_deref(),
+                Some(auth.auth_mode()),
+            );
             let client = OpenAiLlmClient::new(config.model.clone(), &auth)
                 .map_err(|error| anyhow::anyhow!("failed to initialize llm fallback: {error}"))?;
             Ok(LlmFallbackClassifier::new(Arc::new(client), config))

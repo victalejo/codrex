@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -12,6 +14,7 @@ use codex_api::ResponsesClient;
 use codex_api::ResponsesOptions;
 use codex_api::create_text_param_for_request;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_login::AuthMode;
 use codex_login::CodexAuth;
 use codex_model_provider::auth_provider_from_auth;
 use codex_model_provider_info::ModelProviderInfo;
@@ -28,9 +31,15 @@ use crate::Classifier;
 use crate::DelegationSpec;
 
 pub const DEFAULT_LLM_FALLBACK_MODEL: &str = "gpt-5-mini";
+pub const DEFAULT_LLM_FALLBACK_CHATGPT_MODEL: &str = "gpt-5";
 pub const DEFAULT_LLM_FALLBACK_PROVIDER: &str = "openai";
 pub const DEFAULT_LLM_FALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_LLM_FALLBACK_CACHE_SIZE: usize = 256;
+pub const CHATGPT_AUTH_DISABLED_REASON: &str = "llm fallback disabled (auth_mode=chatgpt)";
+static EMITTED_LLM_WARNING_KEYS: LazyLock<Mutex<HashSet<&'static str>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+const INCOMPATIBLE_MODEL_WARNING_KEY: &str = "incompatible_model";
+const CHATGPT_AUTH_DISABLED_WARNING_KEY: &str = "chatgpt_auth_disabled";
 
 /// Structured result returned by the LLM fallback classifier.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,12 +119,31 @@ pub struct LlmFallbackClassifier {
     client: Arc<dyn LlmClient>,
     cache: Arc<Mutex<LruCache<String, CachedLlmDecision>>>,
     config: LlmFallbackConfig,
-    disabled_reason: Option<String>,
+    disabled_state: Option<DisabledLlmFallbackState>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct CachedLlmDecision {
     should_delegate: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiFallbackAvailability {
+    Enabled,
+    DisabledByChatgptAuth,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+struct DisabledLlmFallbackState {
+    reason: String,
+    kind: DisabledLlmFallbackKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisabledLlmFallbackKind {
+    Unavailable,
+    ChatgptAuthDisabled,
 }
 
 impl LlmFallbackClassifier {
@@ -125,22 +153,27 @@ impl LlmFallbackClassifier {
             client,
             cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
             config,
-            disabled_reason: None,
+            disabled_state: None,
         }
     }
 
     pub fn with_disabled_reason(mut self, reason: impl Into<String>) -> Self {
-        self.disabled_reason = Some(reason.into());
+        self.disabled_state = Some(DisabledLlmFallbackState::unavailable(reason));
+        self
+    }
+
+    pub fn with_chatgpt_auth_disabled(mut self) -> Self {
+        self.disabled_state = Some(DisabledLlmFallbackState::chatgpt_auth_disabled());
         self
     }
 
     pub async fn classify(&self, intent: &str) -> ClassificationTrace {
         if !self.config.enabled {
-            return unavailable_trace(
-                self.disabled_reason
-                    .clone()
-                    .unwrap_or_else(|| "llm fallback disabled".to_string()),
-            );
+            return self
+                .disabled_state
+                .clone()
+                .unwrap_or_else(|| DisabledLlmFallbackState::unavailable("llm fallback disabled"))
+                .into_trace();
         }
 
         let cached = match self.cache.lock() {
@@ -225,12 +258,146 @@ pub fn load_openai_auth(
     codex_home: &Path,
     store_mode: AuthCredentialsStoreMode,
 ) -> Result<Option<CodexAuth>, LlmError> {
-    if let Some(api_key) = codex_login::read_openai_api_key_from_env() {
-        return Ok(Some(CodexAuth::from_api_key(&api_key)));
-    }
+    let env_auth = codex_login::read_openai_api_key_from_env()
+        .map(|api_key| CodexAuth::from_api_key(&api_key));
+    let stored_auth = CodexAuth::from_auth_storage(codex_home, store_mode)
+        .map_err(|error| LlmError::Auth(error.to_string()))?;
+    Ok(resolve_openai_auth_sources(env_auth, stored_auth))
+}
 
-    CodexAuth::from_auth_storage(codex_home, store_mode)
-        .map_err(|error| LlmError::Auth(error.to_string()))
+pub fn resolve_openai_auth_sources(
+    env_auth: Option<CodexAuth>,
+    stored_auth: Option<CodexAuth>,
+) -> Option<CodexAuth> {
+    env_auth.or(stored_auth)
+}
+
+pub fn openai_fallback_availability(auth: Option<&CodexAuth>) -> OpenAiFallbackAvailability {
+    match auth.map(CodexAuth::auth_mode) {
+        Some(AuthMode::ApiKey) => OpenAiFallbackAvailability::Enabled,
+        Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens) => {
+            OpenAiFallbackAvailability::DisabledByChatgptAuth
+        }
+        Some(AuthMode::AgentIdentity) | None => OpenAiFallbackAvailability::Unavailable,
+    }
+}
+
+pub fn is_model_compatible_with_auth(model: &str, auth_mode: &AuthMode) -> bool {
+    match auth_mode {
+        AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => matches!(
+            model,
+            "gpt-5" | "gpt-5-codex" | "o3" | "o4-mini" | "gpt-4o" | "gpt-4.1"
+        ),
+        AuthMode::ApiKey => true,
+        AuthMode::AgentIdentity => true,
+    }
+}
+
+pub fn default_model_for_auth(auth_mode: &AuthMode) -> &'static str {
+    match auth_mode {
+        AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => DEFAULT_LLM_FALLBACK_CHATGPT_MODEL,
+        AuthMode::ApiKey => DEFAULT_LLM_FALLBACK_MODEL,
+        AuthMode::AgentIdentity => DEFAULT_LLM_FALLBACK_CHATGPT_MODEL,
+    }
+}
+
+pub fn resolve_llm_fallback_model(
+    configured_model: Option<&str>,
+    auth_mode: Option<AuthMode>,
+) -> String {
+    let resolved = resolve_model_for_auth(configured_model, auth_mode);
+    if let Some((configured_model, auth_mode, fallback_model)) = resolved.warning {
+        warn_incompatible_model_once(&configured_model, auth_mode, fallback_model);
+    }
+    resolved.model
+}
+
+struct ResolvedLlmFallbackModel {
+    model: String,
+    warning: Option<(String, AuthMode, &'static str)>,
+}
+
+fn resolve_model_for_auth(
+    configured_model: Option<&str>,
+    auth_mode: Option<AuthMode>,
+) -> ResolvedLlmFallbackModel {
+    let default_model = auth_mode
+        .as_ref()
+        .map_or(DEFAULT_LLM_FALLBACK_CHATGPT_MODEL, default_model_for_auth);
+    match (configured_model, auth_mode) {
+        (Some(model), Some(auth_mode)) if !is_model_compatible_with_auth(model, &auth_mode) => {
+            ResolvedLlmFallbackModel {
+                model: default_model.to_string(),
+                warning: Some((model.to_string(), auth_mode, default_model)),
+            }
+        }
+        (Some(model), _) => ResolvedLlmFallbackModel {
+            model: model.to_string(),
+            warning: None,
+        },
+        (None, Some(auth_mode)) => ResolvedLlmFallbackModel {
+            model: default_model_for_auth(&auth_mode).to_string(),
+            warning: None,
+        },
+        (None, None) => ResolvedLlmFallbackModel {
+            model: DEFAULT_LLM_FALLBACK_CHATGPT_MODEL.to_string(),
+            warning: None,
+        },
+    }
+}
+
+fn warn_incompatible_model_once(configured_model: &str, auth_mode: AuthMode, fallback_model: &str) {
+    emit_warning_once(INCOMPATIBLE_MODEL_WARNING_KEY, || {
+        let auth_mode_label = auth_mode_label(auth_mode);
+        tracing::warn!(
+            configured_model,
+            auth_mode = auth_mode_label,
+            fallback_model,
+            "configured llm_fallback model '{configured_model}' is not available with your auth mode ({auth_mode_label}). Falling back to '{fallback_model}'. To use '{configured_model}', authenticate with an API key via `codrex login --with-api-key`."
+        );
+    });
+}
+
+fn warn_chatgpt_auth_disabled_once() {
+    emit_warning_once(CHATGPT_AUTH_DISABLED_WARNING_KEY, || {
+        tracing::warn!(
+            auth_mode = "chatgpt",
+            provider = DEFAULT_LLM_FALLBACK_PROVIDER,
+            fallback_state = "disabled",
+            "LLM fallback classifier disabled — your OpenAI auth is ChatGPT account, which doesn't support API access to the models needed for classification. Tasks that don't match a delegation rule will pass through without LLM fallback. To enable LLM fallback: use an API key via `codrex login --with-api-key`, or rely on rules only (no action needed)."
+        );
+        eprintln!(
+            "warn: LLM fallback classifier disabled — your OpenAI auth is\n\
+ChatGPT account, which doesn't support API access to the models\n\
+needed for classification. Tasks that don't match a delegation\n\
+rule will pass through without LLM fallback.\n\
+\n\
+To enable LLM fallback:\n\
+  - Use an API key: codrex login --with-api-key\n\
+  - Or rely on rules only (no action needed)"
+        );
+    });
+}
+
+fn emit_warning_once(key: &'static str, emit: impl FnOnce()) {
+    let should_emit = match EMITTED_LLM_WARNING_KEYS.lock() {
+        Ok(mut emitted) => emitted.insert(key),
+        Err(poisoned) => {
+            let mut emitted = poisoned.into_inner();
+            emitted.insert(key)
+        }
+    };
+    if should_emit {
+        emit();
+    }
+}
+
+fn auth_mode_label(auth_mode: AuthMode) -> &'static str {
+    match auth_mode {
+        AuthMode::ApiKey => "API key",
+        AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => "ChatGPT account",
+        AuthMode::AgentIdentity => "Agent Identity",
+    }
 }
 
 pub struct OpenAiLlmClient {
@@ -359,6 +526,20 @@ fn unavailable_trace(error: String) -> ClassificationTrace {
     }
 }
 
+fn disabled_trace(reason: impl Into<String>) -> ClassificationTrace {
+    ClassificationTrace {
+        outcome: ClassificationOutcome::PassThrough {
+            reason: format!("no rule matched + {}", reason.into()),
+            rule_name: None,
+        },
+        llm_model: None,
+        llm_confidence: None,
+        llm_reasoning: None,
+        llm_error: None,
+        cache_hit: false,
+    }
+}
+
 fn should_use_llm_fallback(outcome: &ClassificationOutcome) -> bool {
     matches!(
         outcome,
@@ -416,4 +597,41 @@ Do NOT delegate when: architectural design, debugging complex issues,\
 security/auth decisions, integrations with new external services,\
 \n\
 ambiguous or open-ended questions."
+}
+
+impl DisabledLlmFallbackState {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            kind: DisabledLlmFallbackKind::Unavailable,
+        }
+    }
+
+    fn chatgpt_auth_disabled() -> Self {
+        Self {
+            reason: CHATGPT_AUTH_DISABLED_REASON.to_string(),
+            kind: DisabledLlmFallbackKind::ChatgptAuthDisabled,
+        }
+    }
+
+    fn into_trace(self) -> ClassificationTrace {
+        match self.kind {
+            DisabledLlmFallbackKind::Unavailable => unavailable_trace(self.reason),
+            DisabledLlmFallbackKind::ChatgptAuthDisabled => {
+                warn_chatgpt_auth_disabled_once();
+                disabled_trace(self.reason)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_llm_fallback_warning_state_for_tests() {
+    match EMITTED_LLM_WARNING_KEYS.lock() {
+        Ok(mut emitted) => emitted.clear(),
+        Err(poisoned) => {
+            let mut emitted = poisoned.into_inner();
+            emitted.clear();
+        }
+    }
 }

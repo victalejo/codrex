@@ -6,6 +6,8 @@ mod device_code_auth;
 mod pkce;
 mod server;
 
+pub use codex_app_server_protocol::AuthMode;
+
 pub use codex_client::BuildCustomCaTransportError as BuildLoginHttpClientError;
 pub use codex_config::types::AuthCredentialsStoreMode;
 pub use device_code_auth::DeviceCode;
@@ -27,13 +29,13 @@ pub use auth::CLIENT_ID;
 pub use auth::CODEX_AGENT_IDENTITY_ENV_VAR;
 pub use auth::CODEX_API_KEY_ENV_VAR;
 pub use auth::CodexAuth;
-pub use auth::ProviderCredentials;
 pub use auth::ExternalAuth;
 pub use auth::ExternalAuthChatgptMetadata;
 pub use auth::ExternalAuthRefreshContext;
 pub use auth::ExternalAuthRefreshReason;
 pub use auth::ExternalAuthTokens;
 pub use auth::OPENAI_API_KEY_ENV_VAR;
+pub use auth::ProviderCredentials;
 pub use auth::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 pub use auth::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
 pub use auth::RefreshTokenError;

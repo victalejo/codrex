@@ -1,3 +1,4 @@
+use crate::CHATGPT_AUTH_DISABLED_REASON;
 use crate::ClassificationOutcome;
 use crate::Classifier;
 use crate::LlmClassification;
@@ -5,11 +6,21 @@ use crate::LlmClient;
 use crate::LlmError;
 use crate::LlmFallbackClassifier;
 use crate::LlmFallbackConfig;
+use crate::OpenAiFallbackAvailability;
 use crate::RulesClassifier;
+use crate::default_model_for_auth;
+use crate::is_model_compatible_with_auth;
+use crate::openai_fallback_availability;
+use crate::resolve_llm_fallback_model;
+use crate::resolve_openai_auth_sources;
 use async_trait::async_trait;
+use codex_login::AuthMode;
+use codex_login::load_auth_dot_json;
 use pretty_assertions::assert_eq;
+use serial_test::serial;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
@@ -144,6 +155,10 @@ fn llm_config(enabled: bool) -> LlmFallbackConfig {
         cache_size: 256,
         enabled,
     }
+}
+
+fn write_auth_json(home: &Path, body: &str) {
+    std::fs::write(home.join("auth.json"), body).expect("auth.json should be written");
 }
 
 #[tokio::test]
@@ -546,4 +561,205 @@ async fn cache_does_not_persist_across_classifier_instances() {
     assert!(!second_trace.cache_hit);
     assert_eq!(first_client.call_count(), 1);
     assert_eq!(second_client.call_count(), 1);
+}
+
+#[test]
+fn auth_chatgpt_with_default_picks_gpt5() {
+    let model = resolve_llm_fallback_model(None, Some(AuthMode::Chatgpt));
+
+    assert_eq!(model, "gpt-5");
+    assert_eq!(default_model_for_auth(&AuthMode::Chatgpt), "gpt-5");
+}
+
+#[test]
+fn auth_apikey_with_default_picks_gpt5_mini() {
+    let model = resolve_llm_fallback_model(None, Some(AuthMode::ApiKey));
+
+    assert_eq!(model, "gpt-5-mini");
+    assert_eq!(default_model_for_auth(&AuthMode::ApiKey), "gpt-5-mini");
+}
+
+#[test]
+fn auth_chatgpt_with_compatible_model_keeps_it() {
+    let model = resolve_llm_fallback_model(Some("gpt-5"), Some(AuthMode::Chatgpt));
+
+    assert_eq!(model, "gpt-5");
+    assert!(is_model_compatible_with_auth("gpt-5", &AuthMode::Chatgpt));
+}
+
+#[test]
+#[tracing_test::traced_test]
+#[serial]
+fn auth_chatgpt_with_incompatible_model_warns_and_falls_back() {
+    super::llm::reset_llm_fallback_warning_state_for_tests();
+    let model = resolve_llm_fallback_model(Some("gpt-5-mini"), Some(AuthMode::Chatgpt));
+
+    assert_eq!(model, "gpt-5");
+    assert!(
+        logs_contain("configured llm_fallback model 'gpt-5-mini' is not available"),
+        "expected incompatibility warning in tracing output"
+    );
+}
+
+#[test]
+fn auth_apikey_with_any_model_keeps_it() {
+    let model = resolve_llm_fallback_model(Some("gpt-3.5-turbo"), Some(AuthMode::ApiKey));
+
+    assert_eq!(model, "gpt-3.5-turbo");
+    assert!(is_model_compatible_with_auth(
+        "gpt-3.5-turbo",
+        &AuthMode::ApiKey
+    ));
+}
+
+#[test]
+fn unknown_auth_mode_treats_as_permissive() {
+    let configured = resolve_llm_fallback_model(Some("gpt-5-mini"), None);
+    let defaulted = resolve_llm_fallback_model(None, None);
+
+    assert_eq!(configured, "gpt-5-mini");
+    assert_eq!(defaulted, "gpt-5");
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+#[serial]
+async fn chatgpt_auth_disables_llm_fallback_with_warning() {
+    super::llm::reset_llm_fallback_warning_state_for_tests();
+    let client = MockLlmClient::with_responses([]);
+    let classifier =
+        LlmFallbackClassifier::new(client.clone(), llm_config(false)).with_chatgpt_auth_disabled();
+
+    let trace = classifier.classify("convert this XML config to YAML").await;
+
+    let ClassificationOutcome::PassThrough { reason, rule_name } = &trace.outcome else {
+        panic!("expected pass-through outcome");
+    };
+    assert_eq!(
+        reason,
+        &format!("no rule matched + {CHATGPT_AUTH_DISABLED_REASON}")
+    );
+    assert_eq!(rule_name, &None);
+    assert_eq!(trace.llm_error, None);
+    assert_eq!(client.call_count(), 0);
+    assert!(logs_contain("LLM fallback classifier disabled"));
+    assert!(logs_contain("auth_mode=\"chatgpt\""));
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+#[serial]
+async fn chatgpt_auth_warning_emitted_only_once() {
+    super::llm::reset_llm_fallback_warning_state_for_tests();
+    let client = MockLlmClient::with_responses([]);
+    let classifier =
+        LlmFallbackClassifier::new(client, llm_config(false)).with_chatgpt_auth_disabled();
+
+    let _ = classifier.classify("convert this XML config to YAML").await;
+    let _ = classifier
+        .classify("explain why my coworker disagrees")
+        .await;
+
+    logs_assert(|lines: &[&str]| {
+        let count = lines
+            .iter()
+            .filter(|line| line.contains("LLM fallback classifier disabled"))
+            .count();
+        if count == 1 {
+            Ok(())
+        } else {
+            Err(format!("expected exactly one warning, got {count}"))
+        }
+    });
+}
+
+#[tokio::test]
+async fn apikey_auth_keeps_llm_fallback_enabled() {
+    let temp = TempDir::new().unwrap();
+    write_auth_json(
+        temp.path(),
+        r#"{
+  "auth_mode": "apikey",
+  "OPENAI_API_KEY": "sk-test-key"
+}"#,
+    );
+
+    let auth = crate::load_openai_auth(temp.path(), codex_login::AuthCredentialsStoreMode::File)
+        .unwrap()
+        .expect("auth should load");
+    assert_eq!(
+        openai_fallback_availability(Some(&auth)),
+        OpenAiFallbackAvailability::Enabled
+    );
+    assert_eq!(
+        load_auth_dot_json(temp.path(), codex_login::AuthCredentialsStoreMode::File)
+            .unwrap()
+            .expect("auth dot json should load")
+            .auth_mode,
+        Some(AuthMode::ApiKey)
+    );
+
+    let client = MockLlmClient::with_responses([(
+        "convert this XML config to YAML",
+        MockLlmResponse::Immediate(Ok(LlmClassification {
+            should_delegate: true,
+            confidence: 0.9,
+            reasoning: "mechanical conversion".to_string(),
+        })),
+    )]);
+    let classifier = LlmFallbackClassifier::new(client.clone(), llm_config(true));
+
+    let _ = classifier.classify("convert this XML config to YAML").await;
+
+    assert_eq!(client.call_count(), 1);
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+#[serial]
+async fn no_credentials_disables_silently() {
+    super::llm::reset_llm_fallback_warning_state_for_tests();
+    let client = MockLlmClient::with_responses([]);
+    let classifier = LlmFallbackClassifier::new(client.clone(), llm_config(false))
+        .with_disabled_reason("no openai credentials configured");
+
+    let trace = classifier.classify("convert this XML config to YAML").await;
+
+    let ClassificationOutcome::PassThrough { reason, rule_name } = &trace.outcome else {
+        panic!("expected pass-through outcome");
+    };
+    assert_eq!(reason, "no rule matched + llm fallback unavailable");
+    assert_eq!(rule_name, &None);
+    assert_eq!(
+        trace.llm_error.as_deref(),
+        Some("no openai credentials configured")
+    );
+    assert_eq!(client.call_count(), 0);
+    assert!(!logs_contain("LLM fallback classifier disabled"));
+}
+
+#[tokio::test]
+async fn env_var_overrides_auth_json() {
+    let temp = TempDir::new().unwrap();
+    write_auth_json(
+        temp.path(),
+        r#"{
+  "auth_mode": "chatgpt"
+}"#,
+    );
+    let stored_auth =
+        crate::load_openai_auth(temp.path(), codex_login::AuthCredentialsStoreMode::File)
+            .unwrap()
+            .expect("stored auth should load");
+    let resolved = resolve_openai_auth_sources(
+        Some(codex_login::CodexAuth::from_api_key("sk-env")),
+        Some(stored_auth),
+    )
+    .expect("resolved auth should exist");
+
+    assert_eq!(resolved.auth_mode(), AuthMode::ApiKey);
+    assert_eq!(
+        openai_fallback_availability(Some(&resolved)),
+        OpenAiFallbackAvailability::Enabled
+    );
 }

@@ -8,8 +8,10 @@ use serde::Deserialize;
 
 mod llm;
 
+pub use llm::CHATGPT_AUTH_DISABLED_REASON;
 pub use llm::ClassificationTrace;
 pub use llm::DEFAULT_LLM_FALLBACK_CACHE_SIZE;
+pub use llm::DEFAULT_LLM_FALLBACK_CHATGPT_MODEL;
 pub use llm::DEFAULT_LLM_FALLBACK_MODEL;
 pub use llm::DEFAULT_LLM_FALLBACK_PROVIDER;
 pub use llm::DEFAULT_LLM_FALLBACK_TIMEOUT;
@@ -18,9 +20,15 @@ pub use llm::LlmClient;
 pub use llm::LlmError;
 pub use llm::LlmFallbackClassifier;
 pub use llm::LlmFallbackConfig;
+pub use llm::OpenAiFallbackAvailability;
 pub use llm::OpenAiLlmClient;
 pub use llm::classify_with_fallback;
+pub use llm::default_model_for_auth;
+pub use llm::is_model_compatible_with_auth;
 pub use llm::load_openai_auth;
+pub use llm::openai_fallback_availability;
+pub use llm::resolve_llm_fallback_model;
+pub use llm::resolve_openai_auth_sources;
 
 use crate::ClassificationOutcome;
 use crate::Classifier;
