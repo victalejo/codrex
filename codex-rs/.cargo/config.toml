@@ -9,3 +9,17 @@ rustflags = ["-C", "link-arg=/STACK:8388608", "-C", "link-arg=/arm64hazardfree"]
 
 [target.'cfg(all(windows, target_env = "gnu"))']
 rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
+
+[env]
+# Some debug-build tests in app-server (e.g. tracing_tests) consume
+# >2 MB of stack under tokio current_thread. Upstream codex addressed
+# this on Windows via the linker flags above (/STACK:8388608).
+# RUST_MIN_STACK is the equivalent on Linux/macOS where the linker
+# flag does not apply.
+#
+# Threshold observed empirically: test passes at 4 MB, fails at 2 MB
+# (default). Setting 8 MB to match the Windows workaround.
+#
+# Tracked as TODO #22. If upstream eventually fixes the test or
+# changes its config, sync this section.
+RUST_MIN_STACK = "8388608"
