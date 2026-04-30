@@ -360,6 +360,30 @@ no debería salir sin esto).
 - **Estimado para fix definitivo:** difícil de estimar sin auditar
   cada test (1-2 días en remediación interna; variable upstream).
 
+## 24. Pin contractual de `OrchestrateOutcome::exit_code()` (Fase 3 commit 9b) — CERRADO PREVENTIVAMENTE
+
+- **Origen:** sugerido durante el plan de commit 9b (2026-04-30) como
+  guardrail contra futuros variants de `OrchestrateOutcome` que podrían
+  hacer drift silencioso de la traducción a exit code.
+- **Estado:** **cerrado preventivamente en commit 9b** (`89860efd1`,
+  `codex-rs/orchestrator/tests/e2e.rs`). El test
+  `outcome_exit_codes_match_main_translation` matchea cada variant
+  contra su entero esperado:
+  - `Ok` → `0`
+  - `Clarify` → `4`
+  - `Escalate` → `2`
+  - `Drop` → `3`
+- **Disparador para futuro:** si Phase 4 introduce un nuevo
+  `OrchestrateOutcome` (e.g. `Resume { run_id }` para el round-trip
+  stateful de [TODO #19](#19-round-trip-stateful-para-clarify-phase-4)),
+  el test rojo va a forzar al desarrollador a actualizar
+  `OrchestrateOutcome::exit_code()` y la traducción en `cli/src/main.rs`
+  explícitamente, en lugar de dejar el nuevo variant con un `_ => 0`
+  silencioso.
+- **Mantenimiento:** ninguno mientras los 4 variants actuales sean los
+  únicos. El test es self-maintaining: no falla salvo en cambio de
+  contrato.
+
 ## 10. `TestSpec` LITE extensions (Fase 3 commit 1)
 
 - **Origen:** Fase 3 commit 1 (`codex-rs/orchestrator/src/spec.rs`).
