@@ -283,6 +283,15 @@ fn proto_string_map(values: HashMap<String, String>) -> proto::StringMap {
 fn proto_wire_api(wire_api: WireApi) -> proto::WireApi {
     match wire_api {
         WireApi::Responses => proto::WireApi::Responses,
+        // The proto schema (codex.thread_config.v1.proto) only defines
+        // WIRE_API_UNSPECIFIED and WIRE_API_RESPONSES. ChatCompletions is a
+        // local-only variant used by the MiniMax adapter and is never
+        // serialized over the remote thread config wire. If a future iteration
+        // needs to transport ChatCompletions remotely, extend the proto enum
+        // first and update this match.
+        WireApi::ChatCompletions => {
+            unreachable!("remote thread config does not transport WireApi::ChatCompletions")
+        }
     }
 }
 
