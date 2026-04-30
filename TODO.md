@@ -220,6 +220,27 @@ no debería salir sin esto).
   rules-based.
 - **Estimado:** 1-2 horas (ajuste de regex + tests de overlap explícito).
 
+## 21. `cargo test --workspace` requiere `pipefail` para detectar fallos reales (Fase 3 commit 9a)
+
+- **Origen:** lección operativa descubierta en commit 9a (2026-04-30) durante
+  la verificación de `docs/orchestrator.md`.
+- **Síntoma:** `cargo test --workspace 2>&1 | tail -80` reporta exit 0 aunque
+  cargo falle, porque el exit code de la pipe es el de `tail`. Esto enmascara
+  errores de compilación en crates del workspace que no se ven con
+  `cargo test -p <crate>` específico.
+- **Disparador:** próxima checklist de verificación manual o helper script de
+  CI que use cargo test trunca con pipes.
+- **Scope:**
+  - Documentar en la guía de verificación manual (referenciada en
+    [TODO #18](#18-guardrail-de-verificación-manual-para-codex-cli-fase-3-commit-8))
+    que las invocaciones de `cargo test` con pipes requieren `set -o pipefail`
+    o redirect a archivo + `wait` con check explícito del exit code.
+  - Considerar un helper en `scripts/` para envolver el patrón:
+    `cargo-test-workspace-verbose` que escriba a archivo y verifique exit
+    explícitamente, evitando el footgun.
+- **Bloqueante de:** ninguno funcional; reduce falsos verdes en auditorías.
+- **Estimado:** 15-30 minutos (doc + helper opcional).
+
 ## 10. `TestSpec` LITE extensions (Fase 3 commit 1)
 
 - **Origen:** Fase 3 commit 1 (`codex-rs/orchestrator/src/spec.rs`).
