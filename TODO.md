@@ -201,6 +201,25 @@ no debería salir sin esto).
   reanudación.
 - **Estimado:** 0.5-1 día con tests y docs.
 
+## 20. Refinar regla `security` en `delegation_rules.toml` (Fase 3 commit 6)
+
+- **Origen:** auditoría de commit 6 (2026-04-30), formalizado durante el plan de
+  commit 9a.
+- **Disparador:** primer reporte de mis-routing donde un prompt de diseño de
+  esquema de auth se delega como `security` cuando debería ir a `design_arch`.
+- **Síntoma:** hoy "design the auth schema" matchea la regla `security` antes
+  que `design_arch` por la mera presencia de la palabra "auth", aunque la
+  intención del prompt sea de diseño/arquitectura, no de implementación o
+  manejo de credenciales sensibles.
+- **Scope:** refinar el pattern de `security` para requerir contexto de
+  implementación o manejo activo de credenciales (e.g. "implement", "handle",
+  "store", "validate", "sanitize") en lugar de cualquier mención de "auth",
+  "password" o "token". Considerar también prioridad explícita entre reglas
+  con overlap en el matcher.
+- **Bloqueante de:** ninguno funcional; mejora la precisión del classifier
+  rules-based.
+- **Estimado:** 1-2 horas (ajuste de regex + tests de overlap explícito).
+
 ## 10. `TestSpec` LITE extensions (Fase 3 commit 1)
 
 - **Origen:** Fase 3 commit 1 (`codex-rs/orchestrator/src/spec.rs`).
