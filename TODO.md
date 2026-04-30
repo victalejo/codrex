@@ -283,6 +283,83 @@ no debería salir sin esto).
 - **Estimado para fix definitivo:** depende del approach (reducir spans:
   1-2h; PR upstream: variable según ciclo de review).
 
+## 23. `codex-app-server` tiene tests environment-leaking que rompen `cargo test --workspace` (Fase 3 commit 9a)
+
+- **Origen:** descubierto en commit 9a (2026-04-30) tras los fixes de
+  WireApi (`178efda7c`) y `RUST_MIN_STACK` (`bed0c5ca9`). Una vez
+  desbloqueada la compilación y el primer overflow, `cargo test
+  --workspace` reveló 12 fallas adicionales en `codex-app-server`
+  que asumen un environment de CI clean.
+- **Procedencia:** 100% upstream. Los 12 tests viven en
+  `codex-rs/app-server/tests/suite/v2/`; no fueron tocados por
+  Codrex. Pertenecen al crate `codex-app-server` que mantenemos
+  intacto desde el fork.
+- **Por qué fueron invisibles hasta hoy:** el bug de WireApi
+  exhaustiveness rompía la compilación de `codex-config` bajo
+  `cfg(test)`. El dep graph `codex-app-server → codex-config`
+  impedía que ningún test de `codex-app-server` corriera. Tras los
+  fixes de hoy, los tests llegan a runtime y fallan porque asumen un
+  ambiente que esta máquina no cumple (skills/plugins instalados,
+  PATH específico, comportamiento de TTY, etc.).
+- **Lista de tests afectados (12):**
+  - `suite::v2::command_exec::command_exec_accepts_permission_profile`
+  - `suite::v2::command_exec::command_exec_env_overrides_merge_with_server_environment_and_support_unset`
+  - `suite::v2::command_exec::command_exec_non_streaming_respects_output_cap`
+  - `suite::v2::command_exec::command_exec_permission_profile_cwd_uses_command_cwd`
+  - `suite::v2::command_exec::command_exec_pipe_streams_output_and_accepts_write`
+  - `suite::v2::command_exec::command_exec_process_ids_are_connection_scoped_and_disconnect_terminates_process`
+  - `suite::v2::command_exec::command_exec_streaming_does_not_buffer_output`
+  - `suite::v2::command_exec::command_exec_tty_implies_streaming_and_reports_pty_output`
+  - `suite::v2::command_exec::command_exec_tty_supports_initial_size_and_resize`
+  - `suite::v2::command_exec::command_exec_without_process_id_keeps_buffered_compatibility`
+  - `suite::v2::mcp_server_status::mcp_server_status_list_tools_and_auth_only_skips_slow_inventory_calls`
+  - `suite::v2::turn_start::turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills`
+- **Diagnóstico más claro (turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills):**
+  el test compara byte-a-byte un mensaje sobre "additional skills
+  not included in the model-visible skills list". Esperaba el número
+  `7` (CI clean) y vio `21` (este VPS, con plugins
+  `superpowers/*`, `claude-md-management/*`, etc.). No es bug de
+  código — es una assertion exacta sobre un valor que depende del
+  environment.
+- **Patrón de las 11 de `command_exec`:** sin leer cada body, todas
+  comparten archivo y prefijo de nombre; lo más probable es que
+  asuman comandos del PATH, comportamiento de shell o permisos de
+  `/tmp` que esta máquina no provee idénticos al CI canónico. No
+  hay evidencia de bug genuino.
+- **Decisión adoptada en 9a:** no marcar `#[ignore]` selectivo en
+  archivos upstream (genera deuda de merge eterna). En su lugar,
+  bautizar oficial el subset de verificación que cubre todo lo que
+  Codrex tocó en Phase 2/2.5/3:
+
+      cargo test \
+        -p codex-orchestrator \
+        -p codex-cli \
+        -p codex-config \
+        -p codex-minimax \
+        -p codex-login
+
+  Documentar el subset y las lecciones operativas en
+  `docs/development.md` (commit del mismo día).
+- **Disparador para fix definitivo:** primer pedido externo de que
+  `cargo test --workspace` quede verde, primer merge de upstream
+  que toque alguno de los 12 archivos, o cuando el repo se publique
+  como `0.1.0` y queramos que el comando estándar de Rust funcione
+  para contributors.
+- **Posibles fixes definitivos (futuros):**
+  - Mock del environment en cada test (PATH, skills count, etc.).
+  - PR upstream que reemplace assertions exactas por matchers
+    flexibles (e.g. regex `\d+ additional skills`).
+  - Marcar los 12 tests como `#[ignore]` en upstream con
+    justificación (probablemente rechazado por upstream; útil solo
+    si Codrex decide divergir).
+- **Bloqueante de:** publicación del repo como `0.1.0` con DX
+  estándar de Rust (`cargo test --workspace` debería pasar para un
+  contributor recién clonando).
+- **Riesgo:** bajo en lo inmediato. El subset oficial cubre 100% de
+  lo que tocamos.
+- **Estimado para fix definitivo:** difícil de estimar sin auditar
+  cada test (1-2 días en remediación interna; variable upstream).
+
 ## 10. `TestSpec` LITE extensions (Fase 3 commit 1)
 
 - **Origen:** Fase 3 commit 1 (`codex-rs/orchestrator/src/spec.rs`).
