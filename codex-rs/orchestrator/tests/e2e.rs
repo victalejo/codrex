@@ -34,8 +34,8 @@ use codex_orchestrator::MinimaxDispatchSink;
 use codex_orchestrator::OrchestrateOutcome;
 use codex_orchestrator::PatternAuditor;
 use codex_orchestrator::RulesClassifier;
-use codex_orchestrator::log::RecordedEvent;
 use codex_orchestrator::classify_with_fallback;
+use codex_orchestrator::log::RecordedEvent;
 use codex_orchestrator::run_orchestration_loop;
 use serial_test::serial;
 use wiremock::Mock;
@@ -91,8 +91,9 @@ mod fixtures {
                     Some(body) => ResponseTemplate::new(200)
                         .set_body_string(sse_body(body))
                         .insert_header("content-type", "text/event-stream"),
-                    None => ResponseTemplate::new(500)
-                        .set_body_string("scripted responses exhausted"),
+                    None => {
+                        ResponseTemplate::new(500).set_body_string("scripted responses exhausted")
+                    }
                 }
             })
             .expect(response_count as u64)
@@ -155,10 +156,7 @@ mod fixtures {
 
     /// Filter `events` to those at a given stage, returning a vec of
     /// references for further inspection.
-    pub fn find_events_by_stage(
-        events: &[RecordedEvent],
-        stage: LogStage,
-    ) -> Vec<&RecordedEvent> {
+    pub fn find_events_by_stage(events: &[RecordedEvent], stage: LogStage) -> Vec<&RecordedEvent> {
         events.iter().filter(|e| e.stage == stage).collect()
     }
 
@@ -236,9 +234,11 @@ use fixtures::mount_scripted_responses_async;
 #[serial(env_minimax)]
 async fn happy_delegate_returns_code() {
     let server = MockServer::start().await;
-    let counter =
-        mount_scripted_responses_async(&server, vec!["fn add(a: i32, b: i32) -> i32 { a + b }".to_string()])
-            .await;
+    let counter = mount_scripted_responses_async(
+        &server,
+        vec!["fn add(a: i32, b: i32) -> i32 { a + b }".to_string()],
+    )
+    .await;
     let _env = EnvGuard::install(&server);
 
     let spec = build_spec("implement add");
@@ -260,12 +260,22 @@ async fn happy_delegate_returns_code() {
         other => panic!("expected Ok, got {other:?}"),
     }
     assert_eq!(outcome.exit_code(), 0);
-    assert_eq!(counter.load(Ordering::SeqCst), 1, "exactly 1 dispatch expected");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "exactly 1 dispatch expected"
+    );
 
     let events = log.events();
     assert_decision_verdict(&events, "ok");
-    assert_eq!(find_events_by_stage(&events, LogStage::DispatchStart).len(), 1);
-    assert_eq!(find_events_by_stage(&events, LogStage::DispatchEnd).len(), 1);
+    assert_eq!(
+        find_events_by_stage(&events, LogStage::DispatchStart).len(),
+        1
+    );
+    assert_eq!(
+        find_events_by_stage(&events, LogStage::DispatchEnd).len(),
+        1
+    );
     assert_eq!(find_events_by_stage(&events, LogStage::Audit).len(), 1);
 }
 
@@ -290,9 +300,8 @@ async fn retry_succeeds_on_attempt_1() {
     let _env = EnvGuard::install(&server);
 
     let mut spec = build_spec("implement fibonacci recursively");
-    spec.acceptance = vec![
-        AcceptanceCriterion::output_matches(r"\brecursive\b").expect("regex must compile"),
-    ];
+    spec.acceptance =
+        vec![AcceptanceCriterion::output_matches(r"\brecursive\b").expect("regex must compile")];
     spec.max_retries = 2;
     let log = InMemoryDecisionLog::new();
     let sink = MinimaxDispatchSink::new("MiniMax-M2.7");
@@ -309,7 +318,11 @@ async fn retry_succeeds_on_attempt_1() {
         other => panic!("expected Ok after retry, got {other:?}"),
     }
     assert_eq!(outcome.exit_code(), 0);
-    assert_eq!(counter.load(Ordering::SeqCst), 2, "exactly 2 dispatches expected");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "exactly 2 dispatches expected"
+    );
 
     let events = log.events();
     assert_eq!(
@@ -321,8 +334,20 @@ async fn retry_succeeds_on_attempt_1() {
 
     let decisions = find_events_by_stage(&events, LogStage::Decision);
     assert_eq!(decisions.len(), 2, "retry decision then ok decision");
-    assert_eq!(decisions[0].payload.get("verdict").and_then(serde_json::Value::as_str), Some("retry"));
-    assert_eq!(decisions[1].payload.get("verdict").and_then(serde_json::Value::as_str), Some("ok"));
+    assert_eq!(
+        decisions[0]
+            .payload
+            .get("verdict")
+            .and_then(serde_json::Value::as_str),
+        Some("retry")
+    );
+    assert_eq!(
+        decisions[1]
+            .payload
+            .get("verdict")
+            .and_then(serde_json::Value::as_str),
+        Some("ok")
+    );
 }
 
 // =============================================================================
@@ -348,9 +373,8 @@ async fn max_retries_exhausted_escalates() {
     let _env = EnvGuard::install(&server);
 
     let mut spec = build_spec("implement parse_iso_date");
-    spec.acceptance = vec![
-        AcceptanceCriterion::output_matches(r"parse_iso_date").expect("regex must compile"),
-    ];
+    spec.acceptance =
+        vec![AcceptanceCriterion::output_matches(r"parse_iso_date").expect("regex must compile")];
     spec.max_retries = 2;
     let log = InMemoryDecisionLog::new();
     let sink = MinimaxDispatchSink::new("MiniMax-M2.7");
@@ -372,16 +396,26 @@ async fn max_retries_exhausted_escalates() {
         other => panic!("expected Escalate after exhausted retries, got {other:?}"),
     }
     assert_eq!(outcome.exit_code(), 2);
-    assert_eq!(counter.load(Ordering::SeqCst), 3, "three dispatches expected");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        3,
+        "three dispatches expected"
+    );
 
     let events = log.events();
-    assert_eq!(find_events_by_stage(&events, LogStage::DispatchStart).len(), 3);
+    assert_eq!(
+        find_events_by_stage(&events, LogStage::DispatchStart).len(),
+        3
+    );
     let decisions = find_events_by_stage(&events, LogStage::Decision);
     let final_decision = decisions
         .last()
         .expect("at least one decision event expected");
     assert_eq!(
-        final_decision.payload.get("verdict").and_then(serde_json::Value::as_str),
+        final_decision
+            .payload
+            .get("verdict")
+            .and_then(serde_json::Value::as_str),
         Some("escalate"),
     );
     assert_eq!(
@@ -405,17 +439,13 @@ async fn loop_detected_drops() {
     // identical signatures → loop detection short-circuits before
     // exhausting retries.
     let identical = "the model insists on the same wrong answer".to_string();
-    let counter = mount_scripted_responses_async(
-        &server,
-        vec![identical.clone(), identical.clone()],
-    )
-    .await;
+    let counter =
+        mount_scripted_responses_async(&server, vec![identical.clone(), identical.clone()]).await;
     let _env = EnvGuard::install(&server);
 
     let mut spec = build_spec("implement the right thing");
-    spec.acceptance = vec![
-        AcceptanceCriterion::output_matches(r"correct").expect("regex must compile"),
-    ];
+    spec.acceptance =
+        vec![AcceptanceCriterion::output_matches(r"correct").expect("regex must compile")];
     spec.max_retries = 5; // generous budget so the trip is via loop, not exhaust
     let log = InMemoryDecisionLog::new();
     let sink = MinimaxDispatchSink::new("MiniMax-M2.7");
@@ -451,7 +481,10 @@ async fn loop_detected_drops() {
         .last()
         .expect("at least one decision event expected");
     assert_eq!(
-        final_decision.payload.get("verdict").and_then(serde_json::Value::as_str),
+        final_decision
+            .payload
+            .get("verdict")
+            .and_then(serde_json::Value::as_str),
         Some("drop"),
     );
     assert!(
@@ -489,9 +522,7 @@ async fn forbidden_pattern_escalates_immediately() {
         .expect("orchestration loop must not error");
 
     match &outcome {
-        OrchestrateOutcome::Escalate {
-            blocking_issue, ..
-        } => {
+        OrchestrateOutcome::Escalate { blocking_issue, .. } => {
             assert!(
                 blocking_issue.contains("forbidden") || blocking_issue.contains("TODO"),
                 "blocking_issue should mention the matched pattern, got: {blocking_issue}"
@@ -542,8 +573,7 @@ async fn clarify_response_exits_4() {
     match &outcome {
         OrchestrateOutcome::Clarify { question } => {
             assert_eq!(
-                question,
-                "should validate_email accept a list or a single string?",
+                question, "should validate_email accept a list or a single string?",
                 "question must be the body of the CLARIFY: prefix, trimmed"
             );
         }
