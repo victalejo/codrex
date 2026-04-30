@@ -36,6 +36,8 @@ pub const DEFAULT_LLM_FALLBACK_PROVIDER: &str = "openai";
 pub const DEFAULT_LLM_FALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_LLM_FALLBACK_CACHE_SIZE: usize = 256;
 pub const CHATGPT_AUTH_DISABLED_REASON: &str = "llm fallback disabled (auth_mode=chatgpt)";
+const NO_CREDENTIALS_DISABLED_REASON: &str = "llm fallback disabled (no credentials)";
+const NO_OPENAI_CREDENTIALS_CONFIGURED: &str = "no openai credentials configured";
 static EMITTED_LLM_WARNING_KEYS: LazyLock<Mutex<HashSet<&'static str>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 const INCOMPATIBLE_MODEL_WARNING_KEY: &str = "incompatible_model";
@@ -144,6 +146,7 @@ struct DisabledLlmFallbackState {
 enum DisabledLlmFallbackKind {
     Unavailable,
     ChatgptAuthDisabled,
+    MissingCredentialsDisabled,
 }
 
 impl LlmFallbackClassifier {
@@ -540,6 +543,23 @@ fn disabled_trace(reason: impl Into<String>) -> ClassificationTrace {
     }
 }
 
+fn disabled_trace_with_error(
+    reason: impl Into<String>,
+    llm_error: impl Into<String>,
+) -> ClassificationTrace {
+    ClassificationTrace {
+        outcome: ClassificationOutcome::PassThrough {
+            reason: format!("no rule matched + {}", reason.into()),
+            rule_name: None,
+        },
+        llm_model: None,
+        llm_confidence: None,
+        llm_reasoning: None,
+        llm_error: Some(llm_error.into()),
+        cache_hit: false,
+    }
+}
+
 fn should_use_llm_fallback(outcome: &ClassificationOutcome) -> bool {
     matches!(
         outcome,
@@ -601,10 +621,13 @@ ambiguous or open-ended questions."
 
 impl DisabledLlmFallbackState {
     fn unavailable(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-            kind: DisabledLlmFallbackKind::Unavailable,
-        }
+        let reason = reason.into();
+        let kind = if reason == NO_OPENAI_CREDENTIALS_CONFIGURED {
+            DisabledLlmFallbackKind::MissingCredentialsDisabled
+        } else {
+            DisabledLlmFallbackKind::Unavailable
+        };
+        Self { reason, kind }
     }
 
     fn chatgpt_auth_disabled() -> Self {
@@ -620,6 +643,9 @@ impl DisabledLlmFallbackState {
             DisabledLlmFallbackKind::ChatgptAuthDisabled => {
                 warn_chatgpt_auth_disabled_once();
                 disabled_trace(self.reason)
+            }
+            DisabledLlmFallbackKind::MissingCredentialsDisabled => {
+                disabled_trace_with_error(NO_CREDENTIALS_DISABLED_REASON, self.reason)
             }
         }
     }

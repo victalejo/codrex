@@ -155,6 +155,27 @@ no debería salir sin esto).
 - **Estimado:** 1 hora (probe + setting), o medio día si requiere
   fallback non-stream.
 
+## 16. Test integral end-to-end de `build_llm_fallback_classifier` (Fase 3 commit 7)
+
+- **Origen:** auditoría de commit 7 (2026-04-30).
+- **Disparador:** próxima pasada de hardening del fallback LLM.
+- **Scope:** agregar un test integral que cubra la cadena completa de
+  resolución `OPENAI_API_KEY env -> auth.json -> sin nada` pasando por
+  `build_llm_fallback_classifier`, no solo helpers unitarios separados.
+- **Bloqueante de:** ninguno; cobertura adicional de precedencia.
+- **Estimado:** 30-45 minutos.
+
+## 17. Refactor cosmético del test `chatgpt_auth_warning_emitted_only_once` (Fase 3 commit 7)
+
+- **Origen:** auditoría de commit 7 (2026-04-30).
+- **Disparador:** próxima limpieza menor del suite de tests.
+- **Scope:** convertir las 2 llamadas explícitas actuales a un loop con
+  `N` parametrizable para expresar mejor la intención "warning emitido
+  exactamente una vez en múltiples classify calls", sin cambiar
+  cobertura funcional.
+- **Bloqueante de:** ninguno; legibilidad solamente.
+- **Estimado:** 15 minutos.
+
 ## 10. `TestSpec` LITE extensions (Fase 3 commit 1)
 
 - **Origen:** Fase 3 commit 1 (`codex-rs/orchestrator/src/spec.rs`).

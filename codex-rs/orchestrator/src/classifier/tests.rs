@@ -728,8 +728,37 @@ async fn no_credentials_disables_silently() {
     let ClassificationOutcome::PassThrough { reason, rule_name } = &trace.outcome else {
         panic!("expected pass-through outcome");
     };
-    assert_eq!(reason, "no rule matched + llm fallback unavailable");
+    assert_eq!(
+        reason,
+        "no rule matched + llm fallback disabled (no credentials)"
+    );
     assert_eq!(rule_name, &None);
+    assert_eq!(
+        trace.llm_error.as_deref(),
+        Some("no openai credentials configured")
+    );
+    assert_eq!(client.call_count(), 0);
+    assert!(!logs_contain("LLM fallback classifier disabled"));
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+#[serial]
+async fn no_credentials_uses_distinctive_disabled_reason_in_jsonl() {
+    super::llm::reset_llm_fallback_warning_state_for_tests();
+    let client = MockLlmClient::with_responses([]);
+    let classifier = LlmFallbackClassifier::new(client.clone(), llm_config(false))
+        .with_disabled_reason("no openai credentials configured");
+
+    let trace = classifier.classify("convert this XML config to YAML").await;
+
+    let ClassificationOutcome::PassThrough { reason, .. } = &trace.outcome else {
+        panic!("expected pass-through outcome");
+    };
+    assert_eq!(
+        reason,
+        "no rule matched + llm fallback disabled (no credentials)"
+    );
     assert_eq!(
         trace.llm_error.as_deref(),
         Some("no openai credentials configured")
