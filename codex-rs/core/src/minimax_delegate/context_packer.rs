@@ -1,3 +1,4 @@
+use super::MiniMaxContextFileSource;
 use super::git_status::GitStatusCandidate;
 use super::git_status::MAX_GIT_CONTEXT_FILES;
 use super::git_status::collect_git_status_candidates;
@@ -21,6 +22,8 @@ pub(crate) struct PackedContextFile {
     pub path: String,
     pub content: String,
     pub truncated: bool,
+    pub redacted: bool,
+    pub source: MiniMaxContextFileSource,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -48,6 +51,7 @@ pub(crate) struct ContextPackRequest<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextCandidateSource {
     ExplicitFile,
+    ExplicitSnippet,
     TaskMention,
     GitModified,
 }
@@ -56,12 +60,23 @@ impl ContextCandidateSource {
     fn omitted_message(self, path: &str, reason: &str) -> String {
         match self {
             Self::GitModified => format!("omitted git modified file {path}: {reason}"),
-            Self::ExplicitFile | Self::TaskMention => format!("omitted {path}: {reason}"),
+            Self::ExplicitFile | Self::ExplicitSnippet | Self::TaskMention => {
+                format!("omitted {path}: {reason}")
+            }
         }
     }
 
     fn is_git_modified(self) -> bool {
         matches!(self, Self::GitModified)
+    }
+
+    fn context_file_source(self) -> MiniMaxContextFileSource {
+        match self {
+            Self::ExplicitFile => MiniMaxContextFileSource::ExplicitFile,
+            Self::ExplicitSnippet => MiniMaxContextFileSource::ExplicitSnippet,
+            Self::TaskMention => MiniMaxContextFileSource::TaskMention,
+            Self::GitModified => MiniMaxContextFileSource::GitModified,
+        }
     }
 }
 
@@ -145,6 +160,7 @@ impl<'a> ContextPacker<'a> {
                 normalized_path,
                 snippet.content.clone(),
                 self.per_file_budget_bytes,
+                ContextCandidateSource::ExplicitSnippet,
             );
             if !added && remaining == 0 {
                 break;
@@ -252,6 +268,7 @@ impl<'a> ContextPacker<'a> {
                     display_path.clone(),
                     content,
                     self.per_file_budget_bytes,
+                    source,
                 );
                 if added && source.is_git_modified() {
                     pack.git_modified_paths.push(display_path);
@@ -492,6 +509,7 @@ fn add_context_entry(
     path: String,
     content: String,
     per_file_budget_bytes: usize,
+    source: ContextCandidateSource,
 ) -> bool {
     if *remaining == 0 {
         mark_total_budget_exhausted(pack);
@@ -536,6 +554,8 @@ fn add_context_entry(
         path,
         content: total_content.to_string(),
         truncated,
+        redacted,
+        source: source.context_file_source(),
     });
     true
 }
@@ -1049,6 +1069,57 @@ mod tests {
     }
 
     #[test]
+    fn includes_staged_added_git_modified_file_when_enabled() {
+        let repo = seed_git_repo();
+        fs::write(repo.path().join("added.txt"), "hello\n").expect("write added file");
+        run_git(&repo, &["add", "added.txt"]);
+
+        let pack = packer(&repo).pack_with_request(ContextPackRequest {
+            explicit_files: &[],
+            explicit_snippets: &[],
+            task_text: "Adjust the helper.",
+            include_modified_files: true,
+        });
+
+        assert_eq!(pack.files.len(), 1);
+        assert_eq!(pack.files[0].path, "added.txt");
+        assert_eq!(pack.files[0].content, "hello\n");
+        assert_eq!(pack.git_modified_paths, vec!["added.txt".to_string()]);
+        assert_eq!(pack.diagnostics.messages, Vec::<String>::new());
+    }
+
+    #[test]
+    fn includes_git_renamed_file_using_new_path() {
+        let repo = seed_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src");
+        fs::write(
+            repo.path().join("src/old.rs"),
+            "pub fn add() -> i32 {\n    1\n}\n",
+        )
+        .expect("write initial source");
+        commit_all(&repo, "init");
+        run_git(&repo, &["mv", "src/old.rs", "src/new.rs"]);
+
+        let pack = packer(&repo).pack_with_request(ContextPackRequest {
+            explicit_files: &[],
+            explicit_snippets: &[],
+            task_text: "Adjust the helper.",
+            include_modified_files: true,
+        });
+
+        assert_eq!(pack.files.len(), 1);
+        assert_eq!(pack.files[0].path, "src/new.rs");
+        assert_eq!(pack.files[0].content, "pub fn add() -> i32 {\n    1\n}\n");
+        assert_eq!(pack.git_modified_paths, vec!["src/new.rs".to_string()]);
+        assert!(
+            pack.diagnostics
+                .messages
+                .iter()
+                .all(|message| !message.contains("old.rs"))
+        );
+    }
+
+    #[test]
     fn keeps_explicit_priority_when_git_reports_the_same_file() {
         let repo = seed_git_repo();
         fs::create_dir_all(repo.path().join("src")).expect("create src");
@@ -1141,6 +1212,25 @@ mod tests {
             pack.diagnostics.messages,
             vec!["omitted git modified file draft.txt: untracked file".to_string()]
         );
+    }
+
+    #[test]
+    fn explicit_untracked_file_is_still_included_when_requested() {
+        let repo = seed_git_repo();
+        fs::write(repo.path().join("draft.txt"), "hello\n").expect("write draft file");
+
+        let pack = packer(&repo).pack_with_request(ContextPackRequest {
+            explicit_files: &["draft.txt".to_string()],
+            explicit_snippets: &[],
+            task_text: "Adjust the helper.",
+            include_modified_files: true,
+        });
+
+        assert_eq!(pack.files.len(), 1);
+        assert_eq!(pack.files[0].path, "draft.txt");
+        assert_eq!(pack.files[0].content, "hello\n");
+        assert_eq!(pack.git_modified_paths, Vec::<String>::new());
+        assert_eq!(pack.diagnostics.messages, Vec::<String>::new());
     }
 
     #[test]

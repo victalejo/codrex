@@ -58,10 +58,13 @@ WORKFLOW:
    - completed: `{"status":"completed","format":"apply_patch"|"unified_diff","summary":"...","patch":"...","diagnostics":["..."]}`
    - clarify: `{"status":"clarify","question":"...","diagnostics":["..."]}`
    - invalid: `{"status":"invalid","error":"...","diagnostics":["..."]}`
+   - The tool may also attach optional `context_summary` metadata describing which local context files were actually included and how many candidate files were omitted
 5. Evaluate that output before applying it:
+   - When `include_modified_files=true`, review `context_summary` and `diagnostics` before applying anything
    - If `status=completed`: review the patch before applying it, then apply it yourself with the normal Codex tools only if it looks correct
    - If `status=clarify`: do not apply anything; ask the user or gather the missing file/context, then retry only after you have new information
    - If `status=invalid`: do not apply anything; if the error is invalid format you may retry once with stricter instructions, and if the error is insufficient context you should attach the relevant files before retrying
+   - If required files were omitted, attach them explicitly on retry; if sensitive files were denied, do not try to force them into MiniMax
    - Avoid indefinite retry loops; if one retry does not fix the issue, either gather better context or do the work yourself
 
 The user may see the worker output in tool history. You are responsible for evaluating quality before applying it."#;
@@ -128,6 +131,29 @@ impl WorkerPatchFormat {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MiniMaxContextFileSource {
+    ExplicitFile,
+    ExplicitSnippet,
+    TaskMention,
+    GitModified,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MiniMaxContextFile {
+    pub path: String,
+    pub source: MiniMaxContextFileSource,
+    pub truncated: bool,
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MiniMaxContextSummary {
+    pub included_files: Vec<MiniMaxContextFile>,
+    pub omitted_count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MiniMaxDelegationResult {
     pub status: MiniMaxDelegationStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,6 +168,8 @@ pub struct MiniMaxDelegationResult {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_summary: Option<MiniMaxContextSummary>,
 }
 
 pub type DelegateToMinimaxResponse = MiniMaxDelegationResult;
@@ -152,6 +180,7 @@ impl MiniMaxDelegationResult {
         summary: String,
         patch: String,
         diagnostics: Vec<String>,
+        context_summary: Option<MiniMaxContextSummary>,
     ) -> Self {
         Self {
             status: MiniMaxDelegationStatus::Completed,
@@ -161,10 +190,15 @@ impl MiniMaxDelegationResult {
             question: None,
             error: None,
             diagnostics,
+            context_summary,
         }
     }
 
-    fn clarify(question: String, diagnostics: Vec<String>) -> Self {
+    fn clarify(
+        question: String,
+        diagnostics: Vec<String>,
+        context_summary: Option<MiniMaxContextSummary>,
+    ) -> Self {
         Self {
             status: MiniMaxDelegationStatus::Clarify,
             format: None,
@@ -173,14 +207,23 @@ impl MiniMaxDelegationResult {
             question: Some(question),
             error: None,
             diagnostics,
+            context_summary,
         }
     }
 
     pub fn invalid(message: impl Into<String>) -> Self {
-        Self::invalid_with_diagnostics(message.into(), Vec::new())
+        Self::invalid_with_context_summary(message.into(), Vec::new(), None)
     }
 
     pub fn invalid_with_diagnostics(message: String, diagnostics: Vec<String>) -> Self {
+        Self::invalid_with_context_summary(message, diagnostics, None)
+    }
+
+    fn invalid_with_context_summary(
+        message: String,
+        diagnostics: Vec<String>,
+        context_summary: Option<MiniMaxContextSummary>,
+    ) -> Self {
         Self {
             status: MiniMaxDelegationStatus::Invalid,
             format: None,
@@ -189,6 +232,7 @@ impl MiniMaxDelegationResult {
             question: None,
             error: Some(message),
             diagnostics,
+            context_summary,
         }
     }
 }
@@ -289,9 +333,11 @@ pub async fn delegate_to_minimax(
     .await?;
 
     let output = collect_stream_text(&mut stream).await?;
+    let context_summary = build_context_summary(&context_pack);
     Ok(parse_delegate_output(
         output.as_str(),
         &context_pack.diagnostics.messages,
+        context_summary,
     ))
 }
 
@@ -391,6 +437,34 @@ fn render_delegate_request(
     text
 }
 
+fn build_context_summary(context_pack: &ContextPack) -> Option<MiniMaxContextSummary> {
+    let included_files = context_pack
+        .files
+        .iter()
+        .map(|file| MiniMaxContextFile {
+            path: file.path.clone(),
+            source: file.source.clone(),
+            truncated: file.truncated,
+            redacted: file.redacted,
+        })
+        .collect::<Vec<_>>();
+    let omitted_count = context_pack
+        .diagnostics
+        .messages
+        .iter()
+        .filter(|message| message.starts_with("omitted "))
+        .count();
+
+    if included_files.is_empty() && omitted_count == 0 {
+        None
+    } else {
+        Some(MiniMaxContextSummary {
+            included_files,
+            omitted_count,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawWorkerResponse {
@@ -412,13 +486,15 @@ struct RawWorkerResponse {
 fn parse_delegate_output(
     output: &str,
     context_diagnostics: &[String],
+    context_summary: Option<MiniMaxContextSummary>,
 ) -> DelegateToMinimaxResponse {
     let trimmed = output.trim();
 
     if trimmed.is_empty() {
-        return MiniMaxDelegationResult::invalid_with_diagnostics(
+        return MiniMaxDelegationResult::invalid_with_context_summary(
             "MiniMax returned no output for delegate_to_minimax.".to_string(),
             context_diagnostics.to_vec(),
+            context_summary,
         );
     }
 
@@ -426,6 +502,7 @@ fn parse_delegate_output(
         return MiniMaxDelegationResult::clarify(
             question.trim().to_string(),
             context_diagnostics.to_vec(),
+            context_summary,
         );
     }
 
@@ -433,19 +510,21 @@ fn parse_delegate_output(
         Ok(response) => response,
         Err(_) => {
             if let Some(format) = detect_patch_format(trimmed) {
-                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                return MiniMaxDelegationResult::invalid_with_context_summary(
                     format!(
                         "MiniMax returned a raw {} patch instead of the required JSON object.",
                         format.as_str()
                     ),
                     context_diagnostics.to_vec(),
+                    context_summary,
                 );
             }
 
-            return MiniMaxDelegationResult::invalid_with_diagnostics(
+            return MiniMaxDelegationResult::invalid_with_context_summary(
                 "MiniMax returned invalid output: expected JSON with status `completed`, `clarify`, or `invalid`."
                     .to_string(),
                 context_diagnostics.to_vec(),
+                context_summary,
             );
         }
     };
@@ -456,52 +535,57 @@ fn parse_delegate_output(
     match response.status {
         MiniMaxDelegationStatus::Completed => {
             let Some(format) = response.format else {
-                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                return MiniMaxDelegationResult::invalid_with_context_summary(
                     "MiniMax returned status `completed` without a patch format.".to_string(),
                     diagnostics,
+                    context_summary,
                 );
             };
 
             let summary = response.summary.unwrap_or_default().trim().to_string();
             if summary.is_empty() {
-                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                return MiniMaxDelegationResult::invalid_with_context_summary(
                     "MiniMax returned a patch candidate without a summary.".to_string(),
                     diagnostics,
+                    context_summary,
                 );
             }
 
             let patch = response.patch.unwrap_or_default().trim().to_string();
             if patch.is_empty() {
-                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                return MiniMaxDelegationResult::invalid_with_context_summary(
                     "MiniMax returned a patch candidate without patch content.".to_string(),
                     diagnostics,
+                    context_summary,
                 );
             }
 
             if let Err(error) = validate_patch_candidate(&format, patch.as_str()) {
                 let mut diagnostics = diagnostics;
                 diagnostics.push(error);
-                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                return MiniMaxDelegationResult::invalid_with_context_summary(
                     format!(
                         "MiniMax returned an invalid {} patch candidate.",
                         format.as_str()
                     ),
                     diagnostics,
+                    context_summary,
                 );
             }
 
-            MiniMaxDelegationResult::completed(format, summary, patch, diagnostics)
+            MiniMaxDelegationResult::completed(format, summary, patch, diagnostics, context_summary)
         }
         MiniMaxDelegationStatus::Clarify => {
             let question = response.question.unwrap_or_default().trim().to_string();
             if question.is_empty() {
-                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                return MiniMaxDelegationResult::invalid_with_context_summary(
                     "MiniMax returned status `clarify` without a question.".to_string(),
                     diagnostics,
+                    context_summary,
                 );
             }
 
-            MiniMaxDelegationResult::clarify(question, diagnostics)
+            MiniMaxDelegationResult::clarify(question, diagnostics, context_summary)
         }
         MiniMaxDelegationStatus::Invalid => {
             let error = response.error.unwrap_or_default().trim().to_string();
@@ -510,7 +594,11 @@ fn parse_delegate_output(
             } else {
                 error
             };
-            MiniMaxDelegationResult::invalid_with_diagnostics(error, diagnostics)
+            MiniMaxDelegationResult::invalid_with_context_summary(
+                error,
+                diagnostics,
+                context_summary,
+            )
         }
     }
 }
@@ -604,6 +692,9 @@ mod tests {
     use super::DEFAULT_CONTEXT_FILE_MAX_BYTES;
     use super::DelegateToMinimaxRequest;
     use super::MINIMAX_DELEGATE_SYSTEM_PROMPT;
+    use super::MiniMaxContextFile;
+    use super::MiniMaxContextFileSource;
+    use super::MiniMaxContextSummary;
     use super::MiniMaxDelegationResult;
     use super::MiniMaxDelegationStatus;
     use super::WorkerPatchFormat;
@@ -662,6 +753,18 @@ mod tests {
         .expect("save minimax credentials");
     }
 
+    fn sample_context_summary() -> MiniMaxContextSummary {
+        MiniMaxContextSummary {
+            included_files: vec![MiniMaxContextFile {
+                path: "src/lib.rs".to_string(),
+                source: MiniMaxContextFileSource::GitModified,
+                truncated: false,
+                redacted: false,
+            }],
+            omitted_count: 1,
+        }
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         original: Option<OsString>,
@@ -698,9 +801,11 @@ mod tests {
 
     #[test]
     fn parse_delegate_output_returns_completed_patch_candidate() {
+        let context_summary = sample_context_summary();
         let result = parse_delegate_output(
             r#"{"status":"completed","format":"apply_patch","summary":"Implement validate_email","patch":"*** Begin Patch\n*** Add File: validate_email.py\n+def validate_email(value: str) -> bool:\n+    return \"@\" in value\n*** End Patch","diagnostics":["worker checked existing helper signature"]}"#,
             &[],
+            Some(context_summary.clone()),
         );
 
         assert_eq!(
@@ -715,15 +820,18 @@ mod tests {
                 question: None,
                 error: None,
                 diagnostics: vec!["worker checked existing helper signature".to_string()],
+                context_summary: Some(context_summary),
             }
         );
     }
 
     #[test]
     fn parse_delegate_output_returns_json_clarify_response() {
+        let context_summary = sample_context_summary();
         let result = parse_delegate_output(
             r#"{"status":"clarify","question":"should I preserve the helper signature?","diagnostics":["need existing helper file"]}"#,
             &["omitted .env: denied path".to_string()],
+            Some(context_summary.clone()),
         );
 
         assert_eq!(
@@ -739,13 +847,18 @@ mod tests {
                     "omitted .env: denied path".to_string(),
                     "need existing helper file".to_string(),
                 ],
+                context_summary: Some(context_summary),
             }
         );
     }
 
     #[test]
     fn parse_delegate_output_keeps_legacy_clarify_compatibility() {
-        let result = parse_delegate_output("CLARIFY: should I preserve the helper signature?", &[]);
+        let result = parse_delegate_output(
+            "CLARIFY: should I preserve the helper signature?",
+            &[],
+            None,
+        );
 
         assert_eq!(
             result,
@@ -757,15 +870,18 @@ mod tests {
                 question: Some("should I preserve the helper signature?".to_string()),
                 error: None,
                 diagnostics: Vec::new(),
+                context_summary: None,
             }
         );
     }
 
     #[test]
     fn parse_delegate_output_returns_invalid_response() {
+        let context_summary = sample_context_summary();
         let result = parse_delegate_output(
             r#"{"status":"invalid","error":"missing src/lib.rs context","diagnostics":["attach src/lib.rs"]}"#,
             &["context truncated: exceeded total budget".to_string()],
+            Some(context_summary.clone()),
         );
 
         assert_eq!(
@@ -781,13 +897,14 @@ mod tests {
                     "context truncated: exceeded total budget".to_string(),
                     "attach src/lib.rs".to_string(),
                 ],
+                context_summary: Some(context_summary),
             }
         );
     }
 
     #[test]
     fn parse_delegate_output_rejects_prose_without_json() {
-        let result = parse_delegate_output("I updated the helper and added tests.", &[]);
+        let result = parse_delegate_output("I updated the helper and added tests.", &[], None);
 
         assert_eq!(
             result,
@@ -802,7 +919,25 @@ mod tests {
                         .to_string()
                 ),
                 diagnostics: Vec::new(),
+                context_summary: None,
             }
+        );
+    }
+
+    #[test]
+    fn parse_delegate_output_without_context_summary_keeps_legacy_shape() {
+        let result = parse_delegate_output(
+            r#"{"status":"invalid","error":"missing context"}"#,
+            &[],
+            None,
+        );
+
+        assert_eq!(result.context_summary, None);
+        assert!(
+            serde_json::to_value(&result)
+                .expect("serialize result")
+                .get("context_summary")
+                .is_none()
         );
     }
 
@@ -851,6 +986,7 @@ mod tests {
                 question: Some("should I add property-based tests?".to_string()),
                 error: None,
                 diagnostics: vec!["need target test file".to_string()],
+                context_summary: None,
             }
         );
     }
@@ -907,6 +1043,15 @@ mod tests {
                 diagnostics: vec![format!(
                     "context file big_context.py truncated at {DEFAULT_CONTEXT_FILE_MAX_BYTES} bytes"
                 )],
+                context_summary: Some(MiniMaxContextSummary {
+                    included_files: vec![MiniMaxContextFile {
+                        path: "big_context.py".to_string(),
+                        source: MiniMaxContextFileSource::ExplicitFile,
+                        truncated: true,
+                        redacted: false,
+                    }],
+                    omitted_count: 0,
+                }),
             }
         );
     }

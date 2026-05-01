@@ -4,6 +4,9 @@
 use anyhow::Result;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::DelegateToMinimaxRequest;
+use codex_core::MiniMaxContextFile;
+use codex_core::MiniMaxContextFileSource;
+use codex_core::MiniMaxContextSummary;
 use codex_core::MiniMaxDelegationStatus;
 use codex_core::config::Constrained;
 use codex_core::delegate_to_minimax;
@@ -210,18 +213,31 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
         "pub fn add(a: i32, b: i32) -> i32 {\n    a * b\n}\n",
     )?;
     std::fs::write(
+        base_test.workspace_path("src/math.rs"),
+        "pub fn multiply(a: i32, b: i32) -> i32 {\n    a * b\n}\n",
+    )?;
+    std::fs::write(
         base_test.workspace_path(".env"),
         "OPENAI_API_KEY=sk-test-secret\n",
     )?;
     run_git(
         &base_test.workspace_path("."),
-        &["add", "src/lib.rs", ".env"],
+        &["add", "src/lib.rs", "src/math.rs", ".env"],
     );
     run_git(&base_test.workspace_path("."), &["commit", "-qm", "init"]);
     std::fs::write(
         base_test.workspace_path("src/lib.rs"),
         "pub fn add(a: i32, b: i32) -> i32 {\n    a - b\n}\n",
     )?;
+    std::fs::write(
+        base_test.workspace_path("src/helper.rs"),
+        "pub fn helper() -> i32 {\n    42\n}\n",
+    )?;
+    run_git(&base_test.workspace_path("."), &["add", "src/helper.rs"]);
+    run_git(
+        &base_test.workspace_path("."),
+        &["mv", "src/math.rs", "src/arithmetic.rs"],
+    );
     std::fs::write(
         base_test.workspace_path(".env"),
         "OPENAI_API_KEY=sk-updated-secret\n",
@@ -280,6 +296,32 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
             "worker checked existing helper signature".to_string(),
         ]
     );
+    assert_eq!(
+        delegate_result.context_summary,
+        Some(MiniMaxContextSummary {
+            included_files: vec![
+                MiniMaxContextFile {
+                    path: "src/arithmetic.rs".to_string(),
+                    source: MiniMaxContextFileSource::GitModified,
+                    truncated: false,
+                    redacted: false,
+                },
+                MiniMaxContextFile {
+                    path: "src/helper.rs".to_string(),
+                    source: MiniMaxContextFileSource::GitModified,
+                    truncated: false,
+                    redacted: false,
+                },
+                MiniMaxContextFile {
+                    path: "src/lib.rs".to_string(),
+                    source: MiniMaxContextFileSource::GitModified,
+                    truncated: false,
+                    redacted: false,
+                },
+            ],
+            omitted_count: 1,
+        })
+    );
     let delegate_result_json = serde_json::to_string(&delegate_result)?;
 
     let minimax_requests = minimax_server.received_requests().await.unwrap_or_default();
@@ -291,6 +333,14 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
     assert!(
         minimax_request_text.contains(r#"<file path=\"src/lib.rs\" truncated=\"false\">"#),
         "expected packed context file in minimax request: {minimax_request_text}"
+    );
+    assert!(
+        minimax_request_text.contains(r#"<file path=\"src/helper.rs\" truncated=\"false\">"#),
+        "expected staged added file in minimax request: {minimax_request_text}"
+    );
+    assert!(
+        minimax_request_text.contains(r#"<file path=\"src/arithmetic.rs\" truncated=\"false\">"#),
+        "expected renamed file in minimax request: {minimax_request_text}"
     );
     assert!(minimax_request_text.contains("pub fn add(a: i32, b: i32) -> i32"));
     assert!(
@@ -342,6 +392,32 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
             "omitted git modified file .env: denied path",
             "worker checked existing helper signature"
         ])
+    );
+    assert_eq!(
+        delegate_output_json["context_summary"],
+        json!({
+            "included_files": [
+                {
+                    "path": "src/arithmetic.rs",
+                    "source": "git_modified",
+                    "truncated": false,
+                    "redacted": false
+                },
+                {
+                    "path": "src/helper.rs",
+                    "source": "git_modified",
+                    "truncated": false,
+                    "redacted": false
+                },
+                {
+                    "path": "src/lib.rs",
+                    "source": "git_modified",
+                    "truncated": false,
+                    "redacted": false
+                }
+            ],
+            "omitted_count": 1
+        })
     );
 
     let (apply_output, apply_success_flag) = call_output(&requests[2], apply_call_id);

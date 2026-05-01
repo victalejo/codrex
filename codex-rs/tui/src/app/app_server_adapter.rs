@@ -1854,6 +1854,7 @@ mod tests {
                 question: Some("should I keep the old signature?".to_string()),
                 error: None,
                 diagnostics: Vec::new(),
+                context_summary: None,
             });
 
         assert_eq!(response.success, true);
@@ -1879,6 +1880,7 @@ mod tests {
                 question: None,
                 error: Some("worker returned prose instead of JSON".to_string()),
                 diagnostics: vec!["expected JSON object".to_string()],
+                context_summary: None,
             });
 
         assert_eq!(response.success, true);
@@ -1930,6 +1932,7 @@ mod tests {
                     "Context files were truncated to 32768 bytes before delegation."
                         .to_string(),
                 ],
+                context_summary: None,
             },
         );
 
