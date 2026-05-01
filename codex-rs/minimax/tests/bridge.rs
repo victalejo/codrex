@@ -6,8 +6,8 @@
 use codex_api::ResponseEvent;
 use codex_minimax::ResponseEventBridge;
 use codex_minimax::streaming::ChatCompletionChunk;
-use pretty_assertions::assert_eq;
 use codex_protocol::models::ResponseItem;
+use pretty_assertions::assert_eq;
 
 fn chunk_from_json(json: &str) -> ChatCompletionChunk {
     serde_json::from_str(json).unwrap_or_else(|err| panic!("bad chunk JSON: {err}: {json}"))

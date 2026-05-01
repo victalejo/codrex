@@ -381,7 +381,10 @@ mod tests {
         assert_eq!(details[0].kind, "reasoning.text");
         assert_eq!(details[0].format, "MiniMax-response-v1");
         let usage = response.usage.expect("usage present");
-        assert_eq!(usage.completion_tokens_details.unwrap().reasoning_tokens, 50);
+        assert_eq!(
+            usage.completion_tokens_details.unwrap().reasoning_tokens,
+            50
+        );
     }
 
     #[test]

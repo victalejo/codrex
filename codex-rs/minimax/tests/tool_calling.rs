@@ -102,8 +102,7 @@ async fn outbound_tool_choice_force_serializes_as_object() {
         .await;
 
     let client = make_client(&server);
-    let mut request =
-        ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
+    let mut request = ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
     request.tools = vec![weather_tool()];
     request.tool_choice = Some(ToolChoice::force("get_weather"));
     client.chat_completion(&request).await.expect("ok");
@@ -111,7 +110,10 @@ async fn outbound_tool_choice_force_serializes_as_object() {
     let received: Vec<Request> = server.received_requests().await.expect("recorded");
     let body: Value = serde_json::from_slice(&received[0].body).expect("json");
     assert_eq!(body["tool_choice"]["type"], json!("function"));
-    assert_eq!(body["tool_choice"]["function"]["name"], json!("get_weather"));
+    assert_eq!(
+        body["tool_choice"]["function"]["name"],
+        json!("get_weather")
+    );
 }
 
 #[tokio::test]
@@ -152,8 +154,7 @@ async fn inbound_tool_call_response_deserializes() {
         ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("weather?")]);
     request.tools = vec![weather_tool()];
     request.tool_choice = Some(ToolChoice::auto());
-    let response: ChatCompletionResponse =
-        client.chat_completion(&request).await.expect("ok");
+    let response: ChatCompletionResponse = client.chat_completion(&request).await.expect("ok");
 
     let choice = &response.choices[0];
     assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
@@ -162,8 +163,7 @@ async fn inbound_tool_call_response_deserializes() {
     assert_eq!(calls[0].id, "call_function_0tldhb4zjgq7_1");
     assert_eq!(calls[0].kind, "function");
     assert_eq!(calls[0].function.name, "get_weather");
-    let args: Value =
-        serde_json::from_str(&calls[0].function.arguments).expect("args parse");
+    let args: Value = serde_json::from_str(&calls[0].function.arguments).expect("args parse");
     assert_eq!(args["city"], json!("SF"));
 }
 
@@ -271,10 +271,7 @@ data: [DONE]\n\n";
     assert_eq!(parsed["city"], json!("SF"));
 }
 
-fn apply_tool_call_deltas(
-    delta: &ChunkDelta,
-    accum: &mut Vec<(u32, String, String, String)>,
-) {
+fn apply_tool_call_deltas(delta: &ChunkDelta, accum: &mut Vec<(u32, String, String, String)>) {
     for tc in &delta.tool_calls {
         if let Some(slot) = accum.iter_mut().find(|(i, ..)| *i == tc.index) {
             if let Some(id) = tc.id.as_deref() {

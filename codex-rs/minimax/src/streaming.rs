@@ -166,9 +166,7 @@ impl MinimaxClient {
                     }
                     match serde_json::from_str::<ChatCompletionChunk>(&data) {
                         Ok(chunk) => Some(Ok(chunk)),
-                        Err(err) => Some(Err(MinimaxError::Decode(format!(
-                            "{err}: data={data}"
-                        )))),
+                        Err(err) => Some(Err(MinimaxError::Decode(format!("{err}: data={data}")))),
                     }
                 }
                 Err(err) => Some(Err(MinimaxError::Decode(format!("sse error: {err}")))),

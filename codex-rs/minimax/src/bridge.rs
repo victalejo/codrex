@@ -272,11 +272,14 @@ impl ResponseEventBridge {
         }
 
         // Translate finish_reason into the optional `end_turn` flag.
-        let end_turn = self.final_finish_reason.as_deref().map(|reason| match reason {
-            "stop" | "length" => true,
-            "tool_calls" => false,
-            _ => false,
-        });
+        let end_turn = self
+            .final_finish_reason
+            .as_deref()
+            .map(|reason| match reason {
+                "stop" | "length" => true,
+                "tool_calls" => false,
+                _ => false,
+            });
 
         // Emit structured cost-logging telemetry exactly once per stream,
         // and only when MiniMax sent a usage block. This is one of the two
@@ -326,11 +329,8 @@ mod cost_log_tests {
     #[test]
     #[tracing_test::traced_test]
     fn finalize_emits_structured_cost_log_with_run_id() {
-        let mut bridge = ResponseEventBridge::with_telemetry(
-            "test-run-id-123",
-            "MiniMax-M2.7",
-            Instant::now(),
-        );
+        let mut bridge =
+            ResponseEventBridge::with_telemetry("test-run-id-123", "MiniMax-M2.7", Instant::now());
         bridge.ingest(chunk(
             r#"{
                 "id":"resp-cost",
@@ -384,11 +384,8 @@ mod cost_log_tests {
     #[test]
     #[tracing_test::traced_test]
     fn finalize_with_telemetry_but_no_usage_emits_nothing() {
-        let mut bridge = ResponseEventBridge::with_telemetry(
-            "no-usage-run",
-            "MiniMax-M2.7",
-            Instant::now(),
-        );
+        let mut bridge =
+            ResponseEventBridge::with_telemetry("no-usage-run", "MiniMax-M2.7", Instant::now());
         bridge.ingest(chunk(
             r#"{"id":"x","choices":[{"index":0,"finish_reason":"stop","delta":{}}]}"#,
         ));

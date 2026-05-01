@@ -28,8 +28,8 @@ pub use crate::auth::storage::AgentIdentityAuthRecord;
 pub use crate::auth::storage::AuthDotJson;
 pub use crate::auth::storage::AuthFile;
 pub use crate::auth::storage::AuthSource;
-pub use crate::auth::storage::ProviderCredentials;
 use crate::auth::storage::AuthStorageBackend;
+pub use crate::auth::storage::ProviderCredentials;
 use crate::auth::storage::create_auth_storage;
 use crate::auth::util::try_parse_error_message;
 use crate::default_client::create_client;
@@ -634,8 +634,7 @@ pub fn save_provider_credentials(
 ) -> std::io::Result<()> {
     let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
     let mut auth = storage.load_file()?.unwrap_or_default();
-    auth.providers
-        .insert(provider_id.to_string(), credentials);
+    auth.providers.insert(provider_id.to_string(), credentials);
     storage.save_file(&auth)
 }
 

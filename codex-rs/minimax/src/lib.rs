@@ -233,7 +233,10 @@ mod tests {
 
     #[test]
     fn base_url_returns_default_when_unset() {
-        assert_eq!(resolve_base_url_with(env_from(&[])), MINIMAX_DEFAULT_BASE_URL);
+        assert_eq!(
+            resolve_base_url_with(env_from(&[])),
+            MINIMAX_DEFAULT_BASE_URL
+        );
     }
 
     #[test]

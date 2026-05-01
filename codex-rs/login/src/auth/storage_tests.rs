@@ -547,8 +547,14 @@ fn auth_file_with_providers_serializes_at_top_level() {
     // OpenAI-shaped fields are flattened at the top level.
     assert_eq!(json["OPENAI_API_KEY"], serde_json::Value::Null);
     // Providers map lives at top-level under `providers`.
-    assert_eq!(json["providers"]["minimax"]["api_key"], serde_json::json!("sk-cp-secret"));
-    assert_eq!(json["providers"]["minimax"]["kind"], serde_json::json!("coding_plan"));
+    assert_eq!(
+        json["providers"]["minimax"]["api_key"],
+        serde_json::json!("sk-cp-secret")
+    );
+    assert_eq!(
+        json["providers"]["minimax"]["kind"],
+        serde_json::json!("coding_plan")
+    );
     assert!(json["providers"]["minimax"].get("last_verified").is_none());
 }
 
@@ -638,9 +644,9 @@ fn auth_file_is_empty_helper_distinguishes_meaningful_state() {
 
 #[test]
 fn save_auth_preserves_providers_across_openai_writes() -> anyhow::Result<()> {
+    use crate::auth::manager::load_provider_credentials;
     use crate::auth::manager::save_auth;
     use crate::auth::manager::save_provider_credentials;
-    use crate::auth::manager::load_provider_credentials;
 
     let codex_home = tempdir()?;
     let mode = AuthCredentialsStoreMode::File;
@@ -670,7 +676,10 @@ fn save_auth_preserves_providers_across_openai_writes() -> anyhow::Result<()> {
     // Step 3: verify both halves still readable.
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
     let loaded = storage.load_file()?.expect("auth file exists");
-    assert_eq!(loaded.openai.openai_api_key.as_deref(), Some("sk-openai-after"));
+    assert_eq!(
+        loaded.openai.openai_api_key.as_deref(),
+        Some("sk-openai-after")
+    );
     let minimax = load_provider_credentials(codex_home.path(), mode, "minimax")?
         .expect("minimax credential preserved across openai login");
     assert_eq!(minimax.api_key, "sk-cp-keep");
@@ -753,11 +762,8 @@ fn provider_credentials_remove_keeps_file_when_openai_present() -> anyhow::Resul
 fn provider_credentials_remove_returns_false_when_absent() -> anyhow::Result<()> {
     use crate::auth::manager::remove_provider_credentials;
     let codex_home = tempdir()?;
-    let removed = remove_provider_credentials(
-        codex_home.path(),
-        AuthCredentialsStoreMode::File,
-        "minimax",
-    )?;
+    let removed =
+        remove_provider_credentials(codex_home.path(), AuthCredentialsStoreMode::File, "minimax")?;
     assert!(!removed);
     Ok(())
 }

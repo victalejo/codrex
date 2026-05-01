@@ -105,10 +105,10 @@ impl JsonlDecisionLog {
     }
 
     fn write_line(&self, line: &str) -> std::io::Result<()> {
-        if let Err(err) = std::fs::create_dir_all(&self.dir) {
-            if err.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(err);
-            }
+        if let Err(err) = std::fs::create_dir_all(&self.dir)
+            && err.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(err);
         }
         let path = self.current_path();
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;

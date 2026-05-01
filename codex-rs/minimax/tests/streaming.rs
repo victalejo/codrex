@@ -63,8 +63,7 @@ async fn stream_yields_text_deltas_in_order() {
         .await;
 
     let client = make_client(&server);
-    let request =
-        ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
+    let request = ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
     let mut stream = client
         .chat_completion_stream(&request)
         .await
@@ -95,7 +94,9 @@ async fn stream_forces_stream_true_on_outbound_body() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(sse(&[r#"{"id":"x","choices":[{"index":0,"finish_reason":"stop","delta":{}}]}"#])),
+                .set_body_string(sse(&[
+                    r#"{"id":"x","choices":[{"index":0,"finish_reason":"stop","delta":{}}]}"#,
+                ])),
         )
         .expect(1)
         .mount(&server)
@@ -105,8 +106,7 @@ async fn stream_forces_stream_true_on_outbound_body() {
     // Build a request with stream=false explicitly — the streaming client
     // must override it to true, otherwise MiniMax would send back a single
     // non-SSE body and there would be no incremental updates.
-    let mut request =
-        ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
+    let mut request = ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
     request.stream = false;
     let mut stream = client
         .chat_completion_stream(&request)
@@ -114,10 +114,8 @@ async fn stream_forces_stream_true_on_outbound_body() {
         .expect("stream opens");
     while stream.next().await.is_some() {}
 
-    let received: Vec<Request> =
-        server.received_requests().await.expect("requests recorded");
-    let body: Value =
-        serde_json::from_slice(&received[0].body).expect("request body is JSON");
+    let received: Vec<Request> = server.received_requests().await.expect("requests recorded");
+    let body: Value = serde_json::from_slice(&received[0].body).expect("request body is JSON");
     assert_eq!(body["stream"], serde_json::json!(true));
     assert_eq!(body["reasoning_split"], serde_json::json!(true));
 }
@@ -142,8 +140,7 @@ async fn stream_emits_reasoning_content_when_split_enabled() {
         .await;
 
     let client = make_client(&server);
-    let request =
-        ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("2+2?")]);
+    let request = ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("2+2?")]);
     let mut stream = client
         .chat_completion_stream(&request)
         .await
@@ -192,8 +189,7 @@ async fn stream_terminates_on_done_sentinel() {
         .await;
 
     let client = make_client(&server);
-    let request =
-        ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
+    let request = ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
     let mut stream = client
         .chat_completion_stream(&request)
         .await
@@ -225,8 +221,7 @@ async fn stream_propagates_5xx_before_streaming() {
         .await;
 
     let client = make_client(&server);
-    let request =
-        ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
+    let request = ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
     match client.chat_completion_stream(&request).await {
         Err(codex_minimax::MinimaxError::Status { status, body }) => {
             assert_eq!(status, 500);
@@ -257,8 +252,7 @@ async fn stream_surfaces_malformed_chunk_but_keeps_running() {
         .await;
 
     let client = make_client(&server);
-    let request =
-        ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
+    let request = ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
     let mut stream = client
         .chat_completion_stream(&request)
         .await

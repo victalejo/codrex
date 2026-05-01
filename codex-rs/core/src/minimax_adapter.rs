@@ -215,10 +215,7 @@ fn translate_response_item(item: ResponseItem) -> Vec<ChatMessage> {
             }])]
         }
         ResponseItem::FunctionCallOutput { call_id, output } => {
-            let body = output
-                .body
-                .to_text()
-                .unwrap_or_default();
+            let body = output.body.to_text().unwrap_or_default();
             vec![ChatMessage::tool_result(call_id, body)]
         }
         ResponseItem::Reasoning { .. } => {
@@ -303,7 +300,8 @@ fn flatten_content(content: &[ContentItem]) -> (String, bool) {
 fn translate_tool(spec: &ToolSpec) -> Option<Tool> {
     match spec {
         ToolSpec::Function(api_tool) => {
-            let parameters = serde_json::to_value(&api_tool.parameters).unwrap_or(serde_json::json!({}));
+            let parameters =
+                serde_json::to_value(&api_tool.parameters).unwrap_or(serde_json::json!({}));
             Some(Tool::function(FunctionDefinition {
                 name: api_tool.name.clone(),
                 description: Some(api_tool.description.clone()),
@@ -544,12 +542,7 @@ pub async fn stream_chat_completions(
                         guard.ingest(chunk)
                     };
                     for ev in events {
-                        emit_cost_log_if_completed(
-                            &ev,
-                            &log_model,
-                            &log_run_id,
-                            started_at,
-                        );
+                        emit_cost_log_if_completed(&ev, &log_model, &log_run_id, started_at);
                         if tx.send(Ok(ev)).await.is_err() {
                             return;
                         }
@@ -589,12 +582,7 @@ fn map_minimax_err(err: codex_minimax::MinimaxError) -> CodexErr {
 /// terminal `Completed` event carrying a `token_usage` block. Shares the
 /// generated `run_id` with the bridge-side log emitted from
 /// `ResponseEventBridge::finalize`, so log aggregators can correlate.
-fn emit_cost_log_if_completed(
-    ev: &ResponseEvent,
-    model: &str,
-    run_id: &str,
-    started_at: Instant,
-) {
+fn emit_cost_log_if_completed(ev: &ResponseEvent, model: &str, run_id: &str, started_at: Instant) {
     if let ResponseEvent::Completed {
         token_usage: Some(usage),
         ..
@@ -837,7 +825,9 @@ mod tests {
     #[test]
     fn function_tool_translates_natively() {
         let mut prompt = Prompt::default();
-        prompt.tools.push(ToolSpec::Function(function_tool("get_weather")));
+        prompt
+            .tools
+            .push(ToolSpec::Function(function_tool("get_weather")));
         prompt.input.push(user_message("hi"));
         let req = translate_prompt(&prompt, "MiniMax-M2.7");
         assert_eq!(req.tools.len(), 1);
@@ -974,14 +964,10 @@ data: [DONE]\n\n";
         let mut prompt = Prompt::default();
         prompt.input.push(user_message("Hi"));
 
-        let stream = stream_chat_completions(
-            &provider,
-            &prompt,
-            "MiniMax-M2.7",
-            reqwest::Client::new(),
-        )
-        .await
-        .expect("stream opens");
+        let stream =
+            stream_chat_completions(&provider, &prompt, "MiniMax-M2.7", reqwest::Client::new())
+                .await
+                .expect("stream opens");
 
         let mut text = String::new();
         let mut completed: Option<i64> = None;
@@ -1123,7 +1109,8 @@ data: [DONE]\n\n";
 
         let system_count = req.messages.iter().filter(|m| m.role == "system").count();
         assert_eq!(
-            system_count, 1,
+            system_count,
+            1,
             "consecutive system messages must be coalesced; got messages: {:?}",
             req.messages.iter().map(|m| &m.role).collect::<Vec<_>>()
         );
@@ -1213,13 +1200,7 @@ data: [DONE]\n\n";
         // Defensive: any future role we don't know about (e.g. a hypothetical
         // 'function' or 'observer') should be remapped to 'user' rather than
         // hitting the wire and getting rejected.
-        assert_eq!(
-            normalize_role_for_minimax("function".to_string()),
-            "user"
-        );
-        assert_eq!(
-            normalize_role_for_minimax("observer".to_string()),
-            "user"
-        );
+        assert_eq!(normalize_role_for_minimax("function".to_string()), "user");
+        assert_eq!(normalize_role_for_minimax("observer".to_string()), "user");
     }
 }

@@ -34,10 +34,7 @@ pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
     let legacy_codex_home_env = std::env::var("CODEX_HOME")
         .ok()
         .filter(|val| !val.is_empty());
-    find_codex_home_from_env(
-        codrex_home_env.as_deref(),
-        legacy_codex_home_env.as_deref(),
-    )
+    find_codex_home_from_env(codrex_home_env.as_deref(), legacy_codex_home_env.as_deref())
 }
 
 fn find_codex_home_from_env(
@@ -140,8 +137,8 @@ mod tests {
             .to_str()
             .expect("missing codrex home path should be valid utf-8");
 
-        let err = find_codex_home_from_env(Some(missing_str), None)
-            .expect_err("missing CODREX_HOME");
+        let err =
+            find_codex_home_from_env(Some(missing_str), None).expect_err("missing CODREX_HOME");
         assert_eq!(err.kind(), ErrorKind::NotFound);
         assert!(
             err.to_string().contains("CODREX_HOME"),
@@ -157,8 +154,8 @@ mod tests {
             .to_str()
             .expect("missing codex home path should be valid utf-8");
 
-        let err = find_codex_home_from_env(None, Some(missing_str))
-            .expect_err("missing CODEX_HOME");
+        let err =
+            find_codex_home_from_env(None, Some(missing_str)).expect_err("missing CODEX_HOME");
         assert_eq!(err.kind(), ErrorKind::NotFound);
         assert!(
             err.to_string().contains("CODEX_HOME"),
@@ -175,8 +172,7 @@ mod tests {
             .to_str()
             .expect("file codrex home path should be valid utf-8");
 
-        let err = find_codex_home_from_env(Some(file_str), None)
-            .expect_err("file CODREX_HOME");
+        let err = find_codex_home_from_env(Some(file_str), None).expect_err("file CODREX_HOME");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(
             err.to_string().contains("not a directory"),
@@ -192,8 +188,7 @@ mod tests {
             .to_str()
             .expect("temp codrex home path should be valid utf-8");
 
-        let resolved =
-            find_codex_home_from_env(Some(temp_str), None).expect("valid CODREX_HOME");
+        let resolved = find_codex_home_from_env(Some(temp_str), None).expect("valid CODREX_HOME");
         let expected = temp_home
             .path()
             .canonicalize()
@@ -215,8 +210,8 @@ mod tests {
             .to_str()
             .expect("codex home should be valid utf-8");
 
-        let resolved = find_codex_home_from_env(Some(codrex_str), Some(codex_str))
-            .expect("valid env vars");
+        let resolved =
+            find_codex_home_from_env(Some(codrex_str), Some(codex_str)).expect("valid env vars");
         let expected = codrex_home
             .path()
             .canonicalize()
@@ -233,8 +228,7 @@ mod tests {
             .to_str()
             .expect("codex home should be valid utf-8");
 
-        let resolved =
-            find_codex_home_from_env(None, Some(codex_str)).expect("valid CODEX_HOME");
+        let resolved = find_codex_home_from_env(None, Some(codex_str)).expect("valid CODEX_HOME");
         let expected = codex_home
             .path()
             .canonicalize()

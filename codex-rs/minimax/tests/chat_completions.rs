@@ -96,22 +96,18 @@ async fn chat_completion_sends_reasoning_split_true_in_body() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(sample_reasoning_split_response()),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(sample_reasoning_split_response()))
         .expect(1)
         .mount(&server)
         .await;
 
     let client = make_client(&server);
-    let request =
-        ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
+    let request = ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
     client.chat_completion(&request).await.expect("ok");
 
     let received: Vec<Request> = server.received_requests().await.expect("requests recorded");
     assert_eq!(received.len(), 1);
-    let body: Value =
-        serde_json::from_slice(&received[0].body).expect("request body is JSON");
+    let body: Value = serde_json::from_slice(&received[0].body).expect("request body is JSON");
     assert_eq!(body["reasoning_split"], json!(true));
     assert_eq!(body["model"], json!("MiniMax-M2.7"));
     assert_eq!(body["messages"][0]["role"], json!("user"));
@@ -140,11 +136,12 @@ async fn chat_completion_propagates_5xx_with_body() {
         .await;
 
     let client = make_client(&server);
-    let request = ChatCompletionRequest::new(
-        "MiniMax-M2.7-highspeed",
-        vec![ChatMessage::user("hi")],
-    );
-    let err = client.chat_completion(&request).await.expect_err("server error");
+    let request =
+        ChatCompletionRequest::new("MiniMax-M2.7-highspeed", vec![ChatMessage::user("hi")]);
+    let err = client
+        .chat_completion(&request)
+        .await
+        .expect_err("server error");
     match err {
         codex_minimax::MinimaxError::Status { status, body } => {
             assert_eq!(status, 500);
@@ -173,8 +170,7 @@ async fn chat_completion_propagates_401_unauthorized() {
         .await;
 
     let client = make_client(&server);
-    let request =
-        ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
+    let request = ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
     let err = client.chat_completion(&request).await.expect_err("401");
     match err {
         codex_minimax::MinimaxError::Status { status, .. } => assert_eq!(status, 401),
@@ -188,10 +184,12 @@ async fn chat_completion_rejects_stream_true_at_non_streaming_endpoint() {
     // Mount nothing — request must fail before any HTTP traffic.
 
     let client = make_client(&server);
-    let mut request =
-        ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
+    let mut request = ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
     request.stream = true;
-    let err = client.chat_completion(&request).await.expect_err("misuse error");
+    let err = client
+        .chat_completion(&request)
+        .await
+        .expect_err("misuse error");
     assert!(matches!(err, codex_minimax::MinimaxError::Decode(_)));
 }
 
@@ -206,9 +204,11 @@ async fn chat_completion_decode_error_includes_body_for_diagnostics() {
         .await;
 
     let client = make_client(&server);
-    let request =
-        ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
-    let err = client.chat_completion(&request).await.expect_err("decode err");
+    let request = ChatCompletionRequest::new("MiniMax-M2.7", vec![ChatMessage::user("hi")]);
+    let err = client
+        .chat_completion(&request)
+        .await
+        .expect_err("decode err");
     match err {
         codex_minimax::MinimaxError::Decode(msg) => {
             assert!(msg.contains("body="));

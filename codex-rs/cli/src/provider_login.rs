@@ -274,27 +274,26 @@ pub async fn run_login_list(cli_config_overrides: CliConfigOverrides) -> ! {
     let mut rows: Vec<ListRow> = Vec::new();
 
     // OpenAI subset, if present in the auth file.
-    if let Ok(Some(openai)) = codex_login::load_auth_dot_json(&config.codex_home, store_mode) {
-        if openai.openai_api_key.is_some()
+    if let Ok(Some(openai)) = codex_login::load_auth_dot_json(&config.codex_home, store_mode)
+        && (openai.openai_api_key.is_some()
             || openai.tokens.is_some()
-            || openai.agent_identity.is_some()
-        {
-            let kind = if openai.tokens.is_some() {
-                "chatgpt"
-            } else if openai.agent_identity.is_some() {
-                "agent_identity"
-            } else {
-                "api_key"
-            };
-            rows.push(ListRow {
-                provider: "openai".to_string(),
-                kind: kind.to_string(),
-                source: auth_source(store_mode).display_label(&config.codex_home),
-                last_verified: openai
-                    .last_refresh
-                    .map(|d| d.format("%Y-%m-%d").to_string()),
-            });
-        }
+            || openai.agent_identity.is_some())
+    {
+        let kind = if openai.tokens.is_some() {
+            "chatgpt"
+        } else if openai.agent_identity.is_some() {
+            "agent_identity"
+        } else {
+            "api_key"
+        };
+        rows.push(ListRow {
+            provider: "openai".to_string(),
+            kind: kind.to_string(),
+            source: auth_source(store_mode).display_label(&config.codex_home),
+            last_verified: openai
+                .last_refresh
+                .map(|d| d.format("%Y-%m-%d").to_string()),
+        });
     }
 
     // Other providers from auth.json::providers.

@@ -476,7 +476,10 @@ pub fn built_in_model_providers(
             LMSTUDIO_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_LMSTUDIO_PORT, WireApi::Responses),
         ),
-        (MINIMAX_PROVIDER_ID, ModelProviderInfo::create_minimax_provider()),
+        (
+            MINIMAX_PROVIDER_ID,
+            ModelProviderInfo::create_minimax_provider(),
+        ),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))

@@ -174,7 +174,7 @@ fn logout_minimax_keeps_openai_credentials_intact() -> Result<()> {
     assert!(
         auth.get("providers")
             .and_then(|p| p.as_object())
-            .is_none_or(|o| o.is_empty()),
+            .is_none_or(serde_json::Map::is_empty),
         "minimax must be gone from providers after logout"
     );
     Ok(())

@@ -94,7 +94,8 @@ impl WidgetRef for &WelcomeWidget {
             "  ".into(),
             "Welcome to ".into(),
             "Codrex".bold(),
-            " — a fork of OpenAI Codex with MiniMax delegation for cost-efficient code generation".into(),
+            " — a fork of OpenAI Codex with MiniMax delegation for cost-efficient code generation"
+                .into(),
         ]));
 
         Paragraph::new(lines)

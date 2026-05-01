@@ -90,10 +90,7 @@ pub enum ModelSelectionError {
     EmptyProviderPrefix(String),
     EmptyModelAfterPrefix(String),
     TooManySlashes(String),
-    ProviderConflict {
-        prefix: String,
-        explicit: String,
-    },
+    ProviderConflict { prefix: String, explicit: String },
     OssConflict(String),
 }
 
@@ -107,10 +104,7 @@ impl std::fmt::Display for ModelSelectionError {
                 )
             }
             Self::EmptyModelAfterPrefix(raw) => {
-                write!(
-                    f,
-                    "invalid --model {raw:?}: model name after '/' is empty"
-                )
+                write!(f, "invalid --model {raw:?}: model name after '/' is empty")
             }
             Self::TooManySlashes(raw) => {
                 write!(

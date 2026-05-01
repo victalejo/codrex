@@ -51,9 +51,10 @@ impl ThinkParser {
                 match self.pending.find(CLOSE_TAG) {
                     Some(idx) => {
                         if idx > 0 {
-                            push_segment(&mut out, ParsedSegment::Reasoning(
-                                self.pending[..idx].to_string(),
-                            ));
+                            push_segment(
+                                &mut out,
+                                ParsedSegment::Reasoning(self.pending[..idx].to_string()),
+                            );
                         }
                         self.pending.drain(..idx + CLOSE_TAG.len());
                         self.inside_think = false;
@@ -62,9 +63,10 @@ impl ThinkParser {
                         // Could the suffix be a partial close tag?
                         let safe_emit_to = trailing_partial_match(&self.pending, CLOSE_TAG);
                         if safe_emit_to > 0 {
-                            push_segment(&mut out, ParsedSegment::Reasoning(
-                                self.pending[..safe_emit_to].to_string(),
-                            ));
+                            push_segment(
+                                &mut out,
+                                ParsedSegment::Reasoning(self.pending[..safe_emit_to].to_string()),
+                            );
                             self.pending.drain(..safe_emit_to);
                         }
                         break;
@@ -74,9 +76,10 @@ impl ThinkParser {
                 match self.pending.find(OPEN_TAG) {
                     Some(idx) => {
                         if idx > 0 {
-                            push_segment(&mut out, ParsedSegment::Text(
-                                self.pending[..idx].to_string(),
-                            ));
+                            push_segment(
+                                &mut out,
+                                ParsedSegment::Text(self.pending[..idx].to_string()),
+                            );
                         }
                         self.pending.drain(..idx + OPEN_TAG.len());
                         self.inside_think = true;
@@ -84,9 +87,10 @@ impl ThinkParser {
                     None => {
                         let safe_emit_to = trailing_partial_match(&self.pending, OPEN_TAG);
                         if safe_emit_to > 0 {
-                            push_segment(&mut out, ParsedSegment::Text(
-                                self.pending[..safe_emit_to].to_string(),
-                            ));
+                            push_segment(
+                                &mut out,
+                                ParsedSegment::Text(self.pending[..safe_emit_to].to_string()),
+                            );
                             self.pending.drain(..safe_emit_to);
                         }
                         break;
@@ -238,10 +242,7 @@ mod tests {
     #[test]
     fn handles_multiple_think_blocks() {
         let mut p = ThinkParser::new();
-        let out = run(
-            &mut p,
-            &["a <think>r1</think> b <think>r2</think> c"],
-        );
+        let out = run(&mut p, &["a <think>r1</think> b <think>r2</think> c"]);
         assert_eq!(
             out,
             vec![

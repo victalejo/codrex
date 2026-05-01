@@ -324,7 +324,7 @@ fn failed_tests_pass(test_spec: &TestSpec, details: &JsonValue) -> FailedCriteri
         name: "tests_pass".to_string(),
         kind: CriterionKind::TestsPass,
         details: FailureDetails::TestsPass {
-            exit_code: to_i32(details.get("exit_code").and_then(|x| x.as_i64())),
+            exit_code: to_i32(details.get("exit_code").and_then(serde_json::Value::as_i64)),
             stderr_excerpt: details
                 .get("stderr")
                 .and_then(|x| x.as_str())
@@ -342,7 +342,7 @@ fn failed_custom(idx: usize, name: &str, details: &JsonValue) -> FailedCriterion
         name: format!("custom[{idx}:{name}]"),
         kind: CriterionKind::Custom,
         details: FailureDetails::Custom {
-            exit_code: to_i32(details.get("exit_code").and_then(|x| x.as_i64())),
+            exit_code: to_i32(details.get("exit_code").and_then(serde_json::Value::as_i64)),
             stderr_excerpt: details
                 .get("stderr")
                 .and_then(|x| x.as_str())

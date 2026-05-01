@@ -50,9 +50,7 @@ fn pick_model() -> String {
 #[ignore = "live MiniMax API; opt in with MINIMAX_LIVE_TEST=1"]
 async fn live_minimax_chat_completion_returns_ok() {
     if !live_enabled() {
-        eprintln!(
-            "{ENABLE_VAR} not set — skipping live MiniMax smoke test."
-        );
+        eprintln!("{ENABLE_VAR} not set — skipping live MiniMax smoke test.");
         return;
     }
 
