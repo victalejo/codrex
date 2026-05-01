@@ -405,6 +405,71 @@ no debería salir sin esto).
   git log.
 - **Estimado:** 30 min (lectura del refactor + decisión + edit).
 
+## 26. Phase 4 commits Z + AA — schema config para roles del orquestador (Fase 4)
+
+- **Origen:** decisión arquitectónica acordada durante Phase 4 commits X+Y
+  (2026-05-01, ver hashes `0d8210a3a` y `672374f69`). El usuario decide
+  qué modelo va a cada rol del orquestador, no hardcoded defaults
+  role-specific. Default unificado `gpt-5.4` cuando un rol no se
+  configura. Razón: los modelos de OpenAI rotan cada 2-3 meses y el
+  user sabe mejor qué modelo le sirve para qué tarea (auditor crítico
+  vs classifier rápido vs spec_refiner).
+- **Disparador:** apertura formal de Phase 4 (después de validar que
+  X+Y son estables y de cerrar TODO #27 si se quiere docs alineados
+  antes).
+- **Scope — Commit Z (config layer):**
+  - Extender `ConfigToml` (en `codex-rs/config/src/types.rs`) con
+    secciones `[orchestrator.classifier]`, `[orchestrator.auditor]`,
+    `[orchestrator.spec_refiner]`, `[orchestrator.worker]`.
+  - Cada rol expone un campo `model: Option<String>`. Default
+    unificado `DEFAULT_LLM_FALLBACK_MODEL` (= `"gpt-5.4"`) cuando
+    `None`. `worker` conserva `provider = "minimax"` y
+    `model = "MiniMax-M2.7"` por default.
+  - Cablear cada rol a su consumidor: classifier → `LlmFallbackConfig`,
+    auditor → futuro `AuditorConfig`, spec_refiner → futuro
+    `SpecRefinerConfig`, worker → existing dispatch.
+  - Tests: configurar / parsear / consumir cada rol; default cuando
+    omitido; override por `-c orchestrator.<role>.model=...`.
+  - Estimado: 200-300 LOC + tests (wiring puro, sin lógica nueva).
+- **Scope — Commit AA (TUI selector), depende de Z:**
+  - Extender el selector de modelos del Codex original
+    (`codex-rs/tui/src/...`) para mostrar los 4 roles del orquestador
+    y permitir cambiar el modelo de cada uno.
+  - Slash command tipo `/role auditor gpt-5.5` que persiste a
+    `~/.codrex/config.toml`.
+  - Estimado: 1-2 sesiones dedicadas de TUI work.
+- **Bloqueante de:** Phase 4 commits BB+ (auditor LLM real, spec
+  refiner, tool execution con modelos diferenciados).
+- **Riesgo:** bajo. Z es wiring sobre infra existente (ya tenemos
+  `LlmFallbackConfig`, `resolve_llm_fallback_model`, etc.). AA toca
+  TUI pero el selector base ya existe en upstream.
+
+## 27. Sweep de `docs/orchestrator.md` post X+Y (Fase 4)
+
+- **Origen:** Phase 4 commits X (`0d8210a3a`) y Y (`672374f69`,
+  2026-05-01) eliminaron el whitelist hardcoded, el silent downgrade,
+  y el gate `DisabledByChatgptAuth`. La doc no se actualizó.
+- **Disparador:** apertura de Commit Z (mismo doc va a tocarse para
+  documentar las nuevas secciones `[orchestrator.<role>]`), o
+  preparación de release `0.1.0`.
+- **Scope:** actualizar `docs/orchestrator.md` para reflejar realidad
+  post-Y. Líneas conocidas con referencias stale:
+  - L383: `model = "gpt-5-mini"` → debe decir `gpt-5.4` y mencionar
+    que el default es unificado.
+  - L686: "arbitrary model whitelist that excludes gpt-5-mini" →
+    obsoleto, no hay whitelist, el backend valida.
+  - L692: reason `"chatgpt auth incompatible"` → ya no se emite, el
+    gate fue eliminado en Y.
+  - L700, L757: "incompatible with gpt-5-mini" → obsoleto.
+  - L762: "OpenAI-side whitelist" + "gpt-5-mini is not on it" →
+    obsoleto.
+  - L815: "well-known case (gpt-5-mini rejected)" → obsoleto.
+- **Bloqueante de:** publicación de `docs/orchestrator.md` como
+  referencia confiable; release `0.1.0` con docs alineados.
+- **Riesgo:** ninguno (cambio de documentación sin impacto en código).
+- **Estimado:** 30-60 min (lectura del doc completo + 7 secciones
+  para reescribir + verificación de coherencia interna).
+
 ## 10. `TestSpec` LITE extensions (Fase 3 commit 1)
 
 - **Origen:** Fase 3 commit 1 (`codex-rs/orchestrator/src/spec.rs`).
