@@ -384,6 +384,27 @@ no debería salir sin esto).
   únicos. El test es self-maintaining: no falla salvo en cambio de
   contrato.
 
+## 25. `try_read_auth_json` is unused after multi-provider refactor (Fase 2.5)
+
+- **Origen:** commit `14f523fcb` (2026-04-27, `refactor(login): extend
+  auth.json schema to multi-provider`). El método
+  `FileAuthStorage::try_read_auth_json` (en
+  `codex-rs/login/src/auth/storage.rs:262`) fue introducido durante el
+  refactor pero ningún caller migró a usarlo, dejando un
+  `warning: method 'try_read_auth_json' is never used` en cada
+  `cargo check`.
+- **Disparador:** próximo sweep de cleanup de la crate `codex-login`,
+  o cuando algún caller del nuevo schema lo necesite.
+- **Scope:** o bien (a) cablearlo desde el caller correspondiente
+  (probablemente `from_auth_storage` o un helper similar) si la
+  intención original era usarlo, o (b) eliminarlo si quedó como
+  scaffolding muerto. Decidir en función del intent del refactor.
+- **Bloqueante de:** nada urgente. Cosmético hasta que alguien fije la
+  política de "zero warnings en `cargo check`".
+- **Riesgo:** bajo. Si lo borramos y algún día se necesita, está en el
+  git log.
+- **Estimado:** 30 min (lectura del refactor + decisión + edit).
+
 ## 10. `TestSpec` LITE extensions (Fase 3 commit 1)
 
 - **Origen:** Fase 3 commit 1 (`codex-rs/orchestrator/src/spec.rs`).
