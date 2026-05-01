@@ -30,8 +30,7 @@ use crate::ClassificationOutcome;
 use crate::Classifier;
 use crate::DelegationSpec;
 
-pub const DEFAULT_LLM_FALLBACK_MODEL: &str = "gpt-5-mini";
-pub const DEFAULT_LLM_FALLBACK_CHATGPT_MODEL: &str = "gpt-5";
+pub const DEFAULT_LLM_FALLBACK_MODEL: &str = "gpt-5.4";
 pub const DEFAULT_LLM_FALLBACK_PROVIDER: &str = "openai";
 pub const DEFAULT_LLM_FALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_LLM_FALLBACK_CACHE_SIZE: usize = 256;
@@ -40,7 +39,6 @@ const NO_CREDENTIALS_DISABLED_REASON: &str = "llm fallback disabled (no credenti
 const NO_OPENAI_CREDENTIALS_CONFIGURED: &str = "no openai credentials configured";
 static EMITTED_LLM_WARNING_KEYS: LazyLock<Mutex<HashSet<&'static str>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
-const INCOMPATIBLE_MODEL_WARNING_KEY: &str = "incompatible_model";
 const CHATGPT_AUTH_DISABLED_WARNING_KEY: &str = "chatgpt_auth_disabled";
 
 /// Structured result returned by the LLM fallback classifier.
@@ -285,80 +283,10 @@ pub fn openai_fallback_availability(auth: Option<&CodexAuth>) -> OpenAiFallbackA
     }
 }
 
-pub fn is_model_compatible_with_auth(model: &str, auth_mode: &AuthMode) -> bool {
-    match auth_mode {
-        AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => matches!(
-            model,
-            "gpt-5" | "gpt-5-codex" | "o3" | "o4-mini" | "gpt-4o" | "gpt-4.1"
-        ),
-        AuthMode::ApiKey => true,
-        AuthMode::AgentIdentity => true,
-    }
-}
-
-pub fn default_model_for_auth(auth_mode: &AuthMode) -> &'static str {
-    match auth_mode {
-        AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => DEFAULT_LLM_FALLBACK_CHATGPT_MODEL,
-        AuthMode::ApiKey => DEFAULT_LLM_FALLBACK_MODEL,
-        AuthMode::AgentIdentity => DEFAULT_LLM_FALLBACK_CHATGPT_MODEL,
-    }
-}
-
-pub fn resolve_llm_fallback_model(
-    configured_model: Option<&str>,
-    auth_mode: Option<AuthMode>,
-) -> String {
-    let resolved = resolve_model_for_auth(configured_model, auth_mode);
-    if let Some((configured_model, auth_mode, fallback_model)) = resolved.warning {
-        warn_incompatible_model_once(&configured_model, auth_mode, fallback_model);
-    }
-    resolved.model
-}
-
-struct ResolvedLlmFallbackModel {
-    model: String,
-    warning: Option<(String, AuthMode, &'static str)>,
-}
-
-fn resolve_model_for_auth(
-    configured_model: Option<&str>,
-    auth_mode: Option<AuthMode>,
-) -> ResolvedLlmFallbackModel {
-    let default_model = auth_mode
-        .as_ref()
-        .map_or(DEFAULT_LLM_FALLBACK_CHATGPT_MODEL, default_model_for_auth);
-    match (configured_model, auth_mode) {
-        (Some(model), Some(auth_mode)) if !is_model_compatible_with_auth(model, &auth_mode) => {
-            ResolvedLlmFallbackModel {
-                model: default_model.to_string(),
-                warning: Some((model.to_string(), auth_mode, default_model)),
-            }
-        }
-        (Some(model), _) => ResolvedLlmFallbackModel {
-            model: model.to_string(),
-            warning: None,
-        },
-        (None, Some(auth_mode)) => ResolvedLlmFallbackModel {
-            model: default_model_for_auth(&auth_mode).to_string(),
-            warning: None,
-        },
-        (None, None) => ResolvedLlmFallbackModel {
-            model: DEFAULT_LLM_FALLBACK_CHATGPT_MODEL.to_string(),
-            warning: None,
-        },
-    }
-}
-
-fn warn_incompatible_model_once(configured_model: &str, auth_mode: AuthMode, fallback_model: &str) {
-    emit_warning_once(INCOMPATIBLE_MODEL_WARNING_KEY, || {
-        let auth_mode_label = auth_mode_label(auth_mode);
-        tracing::warn!(
-            configured_model,
-            auth_mode = auth_mode_label,
-            fallback_model,
-            "configured llm_fallback model '{configured_model}' is not available with your auth mode ({auth_mode_label}). Falling back to '{fallback_model}'. To use '{configured_model}', authenticate with an API key via `codrex login --with-api-key`."
-        );
-    });
+pub fn resolve_llm_fallback_model(configured_model: Option<&str>) -> String {
+    configured_model
+        .map(str::to_string)
+        .unwrap_or_else(|| DEFAULT_LLM_FALLBACK_MODEL.to_string())
 }
 
 fn warn_chatgpt_auth_disabled_once() {
@@ -392,14 +320,6 @@ fn emit_warning_once(key: &'static str, emit: impl FnOnce()) {
     };
     if should_emit {
         emit();
-    }
-}
-
-fn auth_mode_label(auth_mode: AuthMode) -> &'static str {
-    match auth_mode {
-        AuthMode::ApiKey => "API key",
-        AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => "ChatGPT account",
-        AuthMode::AgentIdentity => "Agent Identity",
     }
 }
 

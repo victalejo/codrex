@@ -414,10 +414,8 @@ fn build_llm_fallback_classifier(
                     );
                 }
             }
-            config.model = resolve_llm_fallback_model(
-                runtime.llm_fallback_configured_model.as_deref(),
-                Some(auth.auth_mode()),
-            );
+            config.model =
+                resolve_llm_fallback_model(runtime.llm_fallback_configured_model.as_deref());
             let client = OpenAiLlmClient::new(config.model.clone(), &auth)
                 .map_err(|error| anyhow::anyhow!("failed to initialize llm fallback: {error}"))?;
             Ok(LlmFallbackClassifier::new(Arc::new(client), config))

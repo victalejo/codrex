@@ -8,8 +8,6 @@ use crate::LlmFallbackClassifier;
 use crate::LlmFallbackConfig;
 use crate::OpenAiFallbackAvailability;
 use crate::RulesClassifier;
-use crate::default_model_for_auth;
-use crate::is_model_compatible_with_auth;
 use crate::openai_fallback_availability;
 use crate::resolve_llm_fallback_model;
 use crate::resolve_openai_auth_sources;
@@ -564,61 +562,21 @@ async fn cache_does_not_persist_across_classifier_instances() {
 }
 
 #[test]
-fn auth_chatgpt_with_default_picks_gpt5() {
-    let model = resolve_llm_fallback_model(None, Some(AuthMode::Chatgpt));
-
-    assert_eq!(model, "gpt-5");
-    assert_eq!(default_model_for_auth(&AuthMode::Chatgpt), "gpt-5");
+fn resolve_uses_default_when_no_model_configured() {
+    assert_eq!(resolve_llm_fallback_model(None), "gpt-5.4");
 }
 
 #[test]
-fn auth_apikey_with_default_picks_gpt5_mini() {
-    let model = resolve_llm_fallback_model(None, Some(AuthMode::ApiKey));
-
-    assert_eq!(model, "gpt-5-mini");
-    assert_eq!(default_model_for_auth(&AuthMode::ApiKey), "gpt-5-mini");
-}
-
-#[test]
-fn auth_chatgpt_with_compatible_model_keeps_it() {
-    let model = resolve_llm_fallback_model(Some("gpt-5"), Some(AuthMode::Chatgpt));
-
-    assert_eq!(model, "gpt-5");
-    assert!(is_model_compatible_with_auth("gpt-5", &AuthMode::Chatgpt));
-}
-
-#[test]
-#[tracing_test::traced_test]
-#[serial]
-fn auth_chatgpt_with_incompatible_model_warns_and_falls_back() {
-    super::llm::reset_llm_fallback_warning_state_for_tests();
-    let model = resolve_llm_fallback_model(Some("gpt-5-mini"), Some(AuthMode::Chatgpt));
-
-    assert_eq!(model, "gpt-5");
-    assert!(
-        logs_contain("configured llm_fallback model 'gpt-5-mini' is not available"),
-        "expected incompatibility warning in tracing output"
+fn resolve_passes_configured_model_through_unchanged() {
+    assert_eq!(
+        resolve_llm_fallback_model(Some("gpt-5.5")),
+        "gpt-5.5",
+        "configured model must be used as-is, with no auth-based downgrade"
     );
-}
-
-#[test]
-fn auth_apikey_with_any_model_keeps_it() {
-    let model = resolve_llm_fallback_model(Some("gpt-3.5-turbo"), Some(AuthMode::ApiKey));
-
-    assert_eq!(model, "gpt-3.5-turbo");
-    assert!(is_model_compatible_with_auth(
-        "gpt-3.5-turbo",
-        &AuthMode::ApiKey
-    ));
-}
-
-#[test]
-fn unknown_auth_mode_treats_as_permissive() {
-    let configured = resolve_llm_fallback_model(Some("gpt-5-mini"), None);
-    let defaulted = resolve_llm_fallback_model(None, None);
-
-    assert_eq!(configured, "gpt-5-mini");
-    assert_eq!(defaulted, "gpt-5");
+    assert_eq!(
+        resolve_llm_fallback_model(Some("gpt-5.3-codex")),
+        "gpt-5.3-codex"
+    );
 }
 
 #[tokio::test]
