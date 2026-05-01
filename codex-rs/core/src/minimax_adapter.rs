@@ -535,8 +535,7 @@ pub(crate) async fn stream_chat_completions_with_codex_home(
     http_client: reqwest::Client,
     codex_home: &Path,
 ) -> CodexResult<ResponseStream> {
-    stream_chat_completions_with_home(provider, prompt, model, http_client, Some(codex_home))
-        .await
+    stream_chat_completions_with_home(provider, prompt, model, http_client, Some(codex_home)).await
 }
 
 async fn stream_chat_completions_with_home(

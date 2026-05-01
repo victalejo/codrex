@@ -373,21 +373,23 @@ struct RawWorkerPatchCandidate {
     format: WorkerPatchFormat,
     summary: String,
     patch: String,
+    #[serde(default)]
+    diagnostics: Vec<String>,
 }
 
 fn parse_delegate_output(output: &str, context_truncated: bool) -> DelegateToMinimaxResponse {
     let trimmed = output.trim();
-    let diagnostics = context_truncation_diagnostics(context_truncated);
+    let context_diagnostics = context_truncation_diagnostics(context_truncated);
 
     if trimmed.is_empty() {
         return MiniMaxDelegationResult::invalid_with_diagnostics(
             "MiniMax returned no output for delegate_to_minimax.".to_string(),
-            diagnostics,
+            context_diagnostics,
         );
     }
 
     if let Some(question) = trimmed.strip_prefix(CLARIFY_PREFIX) {
-        return MiniMaxDelegationResult::clarify(question.trim().to_string(), diagnostics);
+        return MiniMaxDelegationResult::clarify(question.trim().to_string(), context_diagnostics);
     }
 
     let candidate = match serde_json::from_str::<RawWorkerPatchCandidate>(trimmed) {
@@ -399,17 +401,20 @@ fn parse_delegate_output(output: &str, context_truncated: bool) -> DelegateToMin
                         "MiniMax returned a raw {} patch instead of the required JSON object.",
                         format.as_str()
                     ),
-                    diagnostics,
+                    context_diagnostics,
                 );
             }
 
             return MiniMaxDelegationResult::invalid_with_diagnostics(
                 "MiniMax returned invalid output: expected JSON patch candidate or `CLARIFY: <question>`."
                     .to_string(),
-                diagnostics,
+                context_diagnostics,
             );
         }
     };
+
+    let mut diagnostics = context_diagnostics;
+    diagnostics.extend(candidate.diagnostics.iter().cloned());
 
     if candidate.status != MiniMaxDelegationStatus::Completed {
         return MiniMaxDelegationResult::invalid_with_diagnostics(
@@ -651,7 +656,7 @@ mod tests {
     #[test]
     fn parse_delegate_output_returns_completed_patch_candidate() {
         let result = parse_delegate_output(
-            r#"{"status":"completed","format":"apply_patch","summary":"Implement validate_email","patch":"*** Begin Patch\n*** Add File: validate_email.py\n+def validate_email(value: str) -> bool:\n+    return \"@\" in value\n*** End Patch"}"#,
+            r#"{"status":"completed","format":"apply_patch","summary":"Implement validate_email","patch":"*** Begin Patch\n*** Add File: validate_email.py\n+def validate_email(value: str) -> bool:\n+    return \"@\" in value\n*** End Patch","diagnostics":["worker checked existing helper signature"]}"#,
             /*context_truncated*/ false,
         );
 
@@ -666,7 +671,7 @@ mod tests {
                 ),
                 question: None,
                 error: None,
-                diagnostics: Vec::new(),
+                diagnostics: vec!["worker checked existing helper signature".to_string()],
             }
         );
     }
@@ -760,7 +765,6 @@ mod tests {
                 diagnostics: Vec::new(),
             }
         );
-
     }
 
     #[tokio::test]
@@ -817,7 +821,6 @@ mod tests {
                 ],
             }
         );
-
     }
 
     #[test]
@@ -844,8 +847,10 @@ mod tests {
     fn delegate_to_minimax_is_available_with_minimax_coding_plan_key_env() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
-        let _minimax_coding_plan_key =
-            EnvVarGuard::set("MINIMAX_CODING_PLAN_KEY", OsStr::new("test-coding-plan-key"));
+        let _minimax_coding_plan_key = EnvVarGuard::set(
+            "MINIMAX_CODING_PLAN_KEY",
+            OsStr::new("test-coding-plan-key"),
+        );
 
         assert!(is_delegate_to_minimax_available(temp_dir.path()));
     }

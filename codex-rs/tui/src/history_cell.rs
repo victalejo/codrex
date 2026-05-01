@@ -1833,7 +1833,7 @@ impl HistoryCell for DynamicToolCallCell {
             | (Some(true), Some(DelegateToMiniMaxOutcome::Invalid))
                 if self.tool == "delegate_to_minimax" =>
             {
-                "•".yellow().bold()
+                "•".magenta().bold()
             }
             (Some(true), _) => "•".green().bold(),
             (None, _) => spinner(Some(self.start_time), self.animations_enabled),

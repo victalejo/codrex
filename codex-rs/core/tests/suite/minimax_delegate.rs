@@ -5,14 +5,18 @@ use anyhow::Result;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::DelegateToMinimaxRequest;
 use codex_core::MiniMaxDelegationStatus;
+use codex_core::config::Constrained;
 use codex_core::delegate_to_minimax;
 use codex_core::delegate_to_minimax_dynamic_tool;
 use codex_login::ProviderCredentials;
 use codex_login::save_provider_credentials;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_apply_patch_function_call;
 use core_test_support::responses::ev_assistant_message;
@@ -165,6 +169,10 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
 
     let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config.include_apply_patch_tool = true;
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+        config
+            .set_legacy_sandbox_policy(SandboxPolicy::DangerFullAccess)
+            .expect("set sandbox policy");
     });
     let base_test = builder.build(&server).await?;
     save_provider_credentials(
@@ -194,7 +202,17 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
     test.codex = new_thread.thread;
     test.session_configured = new_thread.session_configured;
 
-    test.submit_turn("Delegate the mechanical edit to MiniMax, review it, then apply it.")
+    test.codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "Delegate the mechanical edit to MiniMax, review it, then apply it."
+                    .to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
         .await?;
 
     let EventMsg::DynamicToolCallRequest(request) = wait_for_event(&test.codex, |event| {
@@ -209,15 +227,17 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
     assert_eq!(request.tool, "delegate_to_minimax");
     let delegate_request: DelegateToMinimaxRequest =
         serde_json::from_value(request.arguments.clone())?;
-    assert_eq!(delegate_request.task_description, "Change add to return a + b.");
-    assert_eq!(delegate_request.context_files, vec!["src/lib.rs".to_string()]);
+    assert_eq!(
+        delegate_request.task_description,
+        "Change add to return a + b."
+    );
+    assert_eq!(
+        delegate_request.context_files,
+        vec!["src/lib.rs".to_string()]
+    );
 
-    let delegate_result = delegate_to_minimax(
-        delegate_request,
-        test.cwd_path(),
-        test.codex_home_path(),
-    )
-    .await?;
+    let delegate_result =
+        delegate_to_minimax(delegate_request, test.cwd_path(), test.codex_home_path()).await?;
     assert_eq!(delegate_result.status, MiniMaxDelegationStatus::Completed);
     let delegate_result_json = serde_json::to_string(&delegate_result)?;
 
@@ -233,7 +253,10 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
         })
         .await?;
 
-    wait_for_event(&test.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 3);
@@ -247,14 +270,14 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
     );
 
     let (delegate_output, success_flag) = call_output(&requests[1], delegate_call_id);
-    assert_eq!(success_flag, Some(true));
+    assert_eq!(success_flag, None);
     let delegate_output_json: Value = serde_json::from_str(&delegate_output)?;
     assert_eq!(delegate_output_json["status"], "completed");
     assert_eq!(delegate_output_json["summary"], "Implement add");
     assert_eq!(delegate_output_json["patch"], patch);
 
     let (apply_output, apply_success_flag) = call_output(&requests[2], apply_call_id);
-    assert_eq!(apply_success_flag, Some(true));
+    assert_eq!(apply_success_flag, None);
     assert!(
         apply_output.contains("Updated the following files"),
         "apply_patch output should come from the normal tool flow: {apply_output:?}"

@@ -4539,8 +4539,7 @@ impl ChatWidget {
                 "MiniMax requested clarification after {}",
                 crate::status_indicator_widget::fmt_elapsed_compact(duration.as_secs())
             ));
-        } else if delegate_outcome == Some(crate::history_cell::DelegateToMiniMaxOutcome::Invalid)
-        {
+        } else if delegate_outcome == Some(crate::history_cell::DelegateToMiniMaxOutcome::Invalid) {
             self.set_status_header(format!(
                 "MiniMax needs attention after {}",
                 crate::status_indicator_widget::fmt_elapsed_compact(duration.as_secs())

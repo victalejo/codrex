@@ -916,17 +916,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 }
 
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
-    let dynamic_tools = codex_core::is_delegate_to_minimax_available(config.codex_home.as_path())
-        .then(|| {
-            let tool = codex_core::delegate_to_minimax_dynamic_tool();
-            vec![codex_app_server_protocol::DynamicToolSpec {
-                namespace: tool.namespace,
-                name: tool.name,
-                description: tool.description,
-                input_schema: tool.input_schema,
-                defer_loading: tool.defer_loading,
-            }]
-        });
+    let dynamic_tools = delegate_dynamic_tools(config.codex_home.as_path());
 
     ThreadStartParams {
         model: config.model.clone(),
@@ -941,6 +931,21 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
         ephemeral: Some(config.ephemeral),
         ..ThreadStartParams::default()
     }
+}
+
+fn delegate_dynamic_tools(
+    codex_home: &Path,
+) -> Option<Vec<codex_app_server_protocol::DynamicToolSpec>> {
+    codex_core::is_delegate_to_minimax_available(codex_home).then(|| {
+        let tool = codex_core::delegate_to_minimax_dynamic_tool();
+        vec![codex_app_server_protocol::DynamicToolSpec {
+            namespace: tool.namespace,
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+            defer_loading: tool.defer_loading,
+        }]
+    })
 }
 
 fn thread_resume_params_from_config(config: &Config, thread_id: String) -> ThreadResumeParams {

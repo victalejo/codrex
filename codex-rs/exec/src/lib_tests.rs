@@ -469,70 +469,41 @@ async fn thread_start_params_include_delegate_tool_when_minimax_credentials_exis
     assert_eq!(dynamic_tools[0].name, "delegate_to_minimax");
 }
 
-#[tokio::test]
-async fn thread_start_params_include_delegate_tool_when_minimax_api_key_env_exists() {
+#[test]
+fn thread_start_params_include_delegate_tool_when_minimax_api_key_env_exists() {
     let _lock = MINIMAX_ENV_LOCK.lock().expect("lock minimax env");
     let _minimax_api_key = EnvVarGuard::set("MINIMAX_API_KEY", OsStr::new("test-key"));
     let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
     let codex_home = tempdir().expect("create temp codex home");
-    let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(cwd.path().to_path_buf()))
-        .build()
-        .await
-        .expect("build config with minimax env credentials");
-
-    let params = thread_start_params_from_config(&config);
-    let dynamic_tools = params
-        .dynamic_tools
+    let dynamic_tools = delegate_dynamic_tools(codex_home.path())
         .expect("delegate_to_minimax should be registered");
 
     assert_eq!(dynamic_tools.len(), 1);
     assert_eq!(dynamic_tools[0].name, "delegate_to_minimax");
 }
 
-#[tokio::test]
-async fn thread_start_params_include_delegate_tool_when_minimax_coding_plan_env_exists() {
+#[test]
+fn thread_start_params_include_delegate_tool_when_minimax_coding_plan_env_exists() {
     let _lock = MINIMAX_ENV_LOCK.lock().expect("lock minimax env");
     let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
     let _minimax_coding_plan_key =
         EnvVarGuard::set("MINIMAX_CODING_PLAN_KEY", OsStr::new("test-plan-key"));
     let codex_home = tempdir().expect("create temp codex home");
-    let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(cwd.path().to_path_buf()))
-        .build()
-        .await
-        .expect("build config with minimax coding-plan env credentials");
-
-    let params = thread_start_params_from_config(&config);
-    let dynamic_tools = params
-        .dynamic_tools
+    let dynamic_tools = delegate_dynamic_tools(codex_home.path())
         .expect("delegate_to_minimax should be registered");
 
     assert_eq!(dynamic_tools.len(), 1);
     assert_eq!(dynamic_tools[0].name, "delegate_to_minimax");
 }
 
-#[tokio::test]
-async fn thread_start_params_omit_delegate_tool_without_minimax_credentials() {
+#[test]
+fn thread_start_params_omit_delegate_tool_without_minimax_credentials() {
     let _lock = MINIMAX_ENV_LOCK.lock().expect("lock minimax env");
     let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
     let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
     let codex_home = tempdir().expect("create temp codex home");
-    let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(cwd.path().to_path_buf()))
-        .build()
-        .await
-        .expect("build config without minimax credentials");
 
-    let params = thread_start_params_from_config(&config);
-
-    assert_eq!(params.dynamic_tools, None);
+    assert_eq!(delegate_dynamic_tools(codex_home.path()), None);
 }
 
 #[test]
