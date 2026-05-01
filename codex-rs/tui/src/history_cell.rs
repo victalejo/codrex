@@ -1743,6 +1743,13 @@ pub(crate) struct DynamicToolCallCell {
     animations_enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DelegateToMiniMaxOutcome {
+    Completed,
+    Clarify,
+    Invalid,
+}
+
 impl DynamicToolCallCell {
     pub(crate) fn new(
         call_id: String,
@@ -1778,17 +1785,33 @@ impl DynamicToolCallCell {
     }
 
     fn header(&self) -> String {
-        match (self.success, self.is_clarify_response(), self.duration) {
+        match (
+            self.success,
+            delegate_to_minimax_outcome(&self.content_items),
+            self.duration,
+        ) {
             (None, _, _) if self.tool == "delegate_to_minimax" => {
                 "Delegating to MiniMax...".to_string()
             }
             (None, _, _) => format!("Calling {}", self.tool),
+            (Some(_), Some(DelegateToMiniMaxOutcome::Clarify), Some(duration))
+                if self.tool == "delegate_to_minimax" =>
+            {
+                format!(
+                    "MiniMax requested clarification in {}",
+                    format_duration_ms(duration.as_millis() as u64)
+                )
+            }
+            (Some(_), Some(DelegateToMiniMaxOutcome::Invalid), Some(duration))
+                if self.tool == "delegate_to_minimax" =>
+            {
+                format!(
+                    "MiniMax needs attention in {}",
+                    format_duration_ms(duration.as_millis() as u64)
+                )
+            }
             (Some(true), _, Some(duration)) if self.tool == "delegate_to_minimax" => format!(
                 "MiniMax completed in {}",
-                format_duration_ms(duration.as_millis() as u64)
-            ),
-            (Some(false), true, Some(duration)) => format!(
-                "MiniMax requested clarification in {}",
                 format_duration_ms(duration.as_millis() as u64)
             ),
             (Some(false), _, Some(duration)) if self.tool == "delegate_to_minimax" => format!(
@@ -1799,20 +1822,21 @@ impl DynamicToolCallCell {
             (Some(false), _, _) => format!("{} failed", self.tool),
         }
     }
-
-    fn is_clarify_response(&self) -> bool {
-        dynamic_tool_result_text(&self.content_items)
-            .trim_start()
-            .starts_with("CLARIFY:")
-    }
 }
 
 impl HistoryCell for DynamicToolCallCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let bullet = match self.success {
-            Some(true) => "•".green().bold(),
-            Some(false) => "•".red().bold(),
-            None => spinner(Some(self.start_time), self.animations_enabled),
+        let delegate_outcome = delegate_to_minimax_outcome(&self.content_items);
+        let bullet = match (self.success, delegate_outcome) {
+            (Some(false), _) => "•".red().bold(),
+            (Some(true), Some(DelegateToMiniMaxOutcome::Clarify))
+            | (Some(true), Some(DelegateToMiniMaxOutcome::Invalid))
+                if self.tool == "delegate_to_minimax" =>
+            {
+                "•".yellow().bold()
+            }
+            (Some(true), _) => "•".green().bold(),
+            (None, _) => spinner(Some(self.start_time), self.animations_enabled),
         };
 
         let mut lines = vec![Line::from(vec![bullet, " ".into(), self.header().bold()])];
@@ -1884,6 +1908,35 @@ fn dynamic_tool_result_text(items: &[DynamicToolCallOutputContentItem]) -> Strin
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub(crate) fn delegate_to_minimax_outcome(
+    items: &[DynamicToolCallOutputContentItem],
+) -> Option<DelegateToMiniMaxOutcome> {
+    let output = dynamic_tool_result_text(items);
+    delegate_to_minimax_outcome_from_text(output.as_str())
+}
+
+fn delegate_to_minimax_outcome_from_text(output: &str) -> Option<DelegateToMiniMaxOutcome> {
+    if let Ok(result) = serde_json::from_str::<crate::legacy_core::MiniMaxDelegationResult>(output)
+    {
+        return Some(match result.status {
+            crate::legacy_core::MiniMaxDelegationStatus::Completed => {
+                DelegateToMiniMaxOutcome::Completed
+            }
+            crate::legacy_core::MiniMaxDelegationStatus::Clarify => {
+                DelegateToMiniMaxOutcome::Clarify
+            }
+            crate::legacy_core::MiniMaxDelegationStatus::Invalid => {
+                DelegateToMiniMaxOutcome::Invalid
+            }
+        });
+    }
+
+    output
+        .trim_start()
+        .starts_with("CLARIFY:")
+        .then_some(DelegateToMiniMaxOutcome::Clarify)
 }
 
 fn web_search_header(completed: bool) -> &'static str {
@@ -4816,16 +4869,18 @@ mod tests {
         cell.complete(
             Duration::from_secs(12),
             /*success*/ true,
-            vec![
-                DynamicToolCallOutputContentItem::InputText {
-                    text: "Note: context files were truncated to 32768 bytes before delegation."
-                        .to_string(),
-                },
-                DynamicToolCallOutputContentItem::InputText {
-                    text: "def validate_email(value: str) -> bool:\n    return \"@\" in value"
-                        .to_string(),
-                },
-            ],
+            vec![DynamicToolCallOutputContentItem::InputText {
+                text: serde_json::json!({
+                    "status": "completed",
+                    "format": "apply_patch",
+                    "summary": "Implement validate_email",
+                    "patch": "*** Begin Patch\n*** Add File: validate_email.py\n+def validate_email(value: str) -> bool:\n+    return \"@\" in value\n*** End Patch",
+                    "diagnostics": [
+                        "Context files were truncated to 32768 bytes before delegation."
+                    ],
+                })
+                .to_string(),
+            }],
         );
 
         let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
@@ -4845,9 +4900,13 @@ mod tests {
         );
         cell.complete(
             Duration::from_secs(7),
-            /*success*/ false,
+            /*success*/ true,
             vec![DynamicToolCallOutputContentItem::InputText {
-                text: "CLARIFY: should I preserve the existing helper signature?".to_string(),
+                text: serde_json::json!({
+                    "status": "clarify",
+                    "question": "should I preserve the existing helper signature?"
+                })
+                .to_string(),
             }],
         );
 

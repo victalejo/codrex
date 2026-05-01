@@ -336,10 +336,17 @@ impl App {
         .map_err(|err| format!("delegate_to_minimax received invalid arguments: {err}"));
         let request_handle = app_server_client.request_handle();
         let thread_id_text = params.thread_id;
+        let codex_home = self.chat_widget.config_ref().codex_home.clone();
         tokio::spawn(async move {
             let response = match (cwd, request) {
                 (Some(cwd), Ok(request)) => {
-                    match crate::legacy_core::delegate_to_minimax(request, cwd.as_path()).await {
+                    match crate::legacy_core::delegate_to_minimax(
+                        request,
+                        cwd.as_path(),
+                        codex_home.as_path(),
+                    )
+                    .await
+                    {
                         Ok(response) => delegate_dynamic_tool_response(response),
                         Err(err) => dynamic_tool_failure_response(format!(
                             "MiniMax delegation failed: {err}"
@@ -391,24 +398,9 @@ impl App {
 fn delegate_dynamic_tool_response(
     response: crate::legacy_core::DelegateToMinimaxResponse,
 ) -> codex_app_server_protocol::DynamicToolCallResponse {
-    match response {
-        crate::legacy_core::DelegateToMinimaxResponse::Completed {
-            output,
-            context_truncated,
-        } => codex_app_server_protocol::DynamicToolCallResponse {
-            content_items: dynamic_tool_content_items(output, context_truncated),
-            success: true,
-        },
-        crate::legacy_core::DelegateToMinimaxResponse::Clarify {
-            question,
-            context_truncated,
-        } => codex_app_server_protocol::DynamicToolCallResponse {
-            content_items: dynamic_tool_content_items(
-                format!("CLARIFY: {question}"),
-                context_truncated,
-            ),
-            success: false,
-        },
+    codex_app_server_protocol::DynamicToolCallResponse {
+        content_items: dynamic_tool_content_items(response),
+        success: true,
     }
 }
 
@@ -426,24 +418,17 @@ fn dynamic_tool_failure_response(
 }
 
 fn dynamic_tool_content_items(
-    output: String,
-    context_truncated: bool,
+    response: crate::legacy_core::DelegateToMinimaxResponse,
 ) -> Vec<codex_app_server_protocol::DynamicToolCallOutputContentItem> {
-    let mut items = Vec::with_capacity(2);
-    if context_truncated {
-        items.push(
-            codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
-                text: format!(
-                    "Note: context files were truncated to {} bytes before delegation.",
-                    crate::legacy_core::CONTEXT_FILES_MAX_BYTES
-                ),
-            },
-        );
-    }
-    items.push(
-        codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text: output },
-    );
-    items
+    let text = serde_json::to_string(&response).unwrap_or_else(|err| {
+        serde_json::json!({
+            "status": "invalid",
+            "error": format!("failed to serialize delegate_to_minimax response: {err}"),
+        })
+        .to_string()
+    });
+
+    vec![codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text }]
 }
 
 fn server_request_thread_id(request: &ServerRequest) -> Option<ThreadId> {
@@ -1859,46 +1844,113 @@ mod tests {
     }
 
     #[test]
-    fn delegate_dynamic_tool_response_marks_clarify_as_failure() {
-        let response = super::delegate_dynamic_tool_response(
-            crate::legacy_core::DelegateToMinimaxResponse::Clarify {
-                question: "should I keep the old signature?".to_string(),
-                context_truncated: false,
-            },
+    fn delegate_dynamic_tool_response_marks_clarify_as_success() {
+        let response =
+            super::delegate_dynamic_tool_response(crate::legacy_core::DelegateToMinimaxResponse {
+                status: crate::legacy_core::MiniMaxDelegationStatus::Clarify,
+                format: None,
+                summary: None,
+                patch: None,
+                question: Some("should I keep the old signature?".to_string()),
+                error: None,
+                diagnostics: Vec::new(),
+            });
+
+        assert_eq!(response.success, true);
+        let [codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text }] =
+            response.content_items.as_slice()
+        else {
+            panic!("expected a single text output item");
+        };
+        let result: serde_json::Value =
+            serde_json::from_str(text).expect("clarify result should serialize as json");
+        assert_eq!(result["status"], "clarify");
+        assert_eq!(result["question"], "should I keep the old signature?");
+    }
+
+    #[test]
+    fn delegate_dynamic_tool_response_marks_invalid_as_success() {
+        let response =
+            super::delegate_dynamic_tool_response(crate::legacy_core::DelegateToMinimaxResponse {
+                status: crate::legacy_core::MiniMaxDelegationStatus::Invalid,
+                format: None,
+                summary: None,
+                patch: None,
+                question: None,
+                error: Some("worker returned prose instead of JSON".to_string()),
+                diagnostics: vec!["expected JSON object".to_string()],
+            });
+
+        assert_eq!(response.success, true);
+        let [codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text }] =
+            response.content_items.as_slice()
+        else {
+            panic!("expected a single text output item");
+        };
+        let result: serde_json::Value =
+            serde_json::from_str(text).expect("invalid result should serialize as json");
+        assert_eq!(result["status"], "invalid");
+        assert_eq!(result["error"], "worker returned prose instead of JSON");
+        assert_eq!(
+            result["diagnostics"],
+            serde_json::json!(["expected JSON object"])
         );
+    }
+
+    #[test]
+    fn dynamic_tool_failure_response_marks_infrastructure_errors_as_failure() {
+        let response =
+            super::dynamic_tool_failure_response("MiniMax delegation failed: timeout".to_string());
 
         assert_eq!(response.success, false);
         assert_eq!(
             response.content_items,
             vec![
                 codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
-                    text: "CLARIFY: should I keep the old signature?".to_string(),
+                    text: "MiniMax delegation failed: timeout".to_string(),
                 }
             ]
         );
     }
 
     #[test]
-    fn delegate_dynamic_tool_response_includes_truncation_warning() {
+    fn delegate_dynamic_tool_response_serializes_patch_candidate() {
         let response = super::delegate_dynamic_tool_response(
-            crate::legacy_core::DelegateToMinimaxResponse::Completed {
-                output: "def fizzbuzz(n):\n    return []".to_string(),
-                context_truncated: true,
+            crate::legacy_core::DelegateToMinimaxResponse {
+                status: crate::legacy_core::MiniMaxDelegationStatus::Completed,
+                format: Some(crate::legacy_core::WorkerPatchFormat::ApplyPatch),
+                summary: Some("Implement fizzbuzz".to_string()),
+                patch: Some(
+                    "*** Begin Patch\n*** Add File: fizzbuzz.py\n+def fizzbuzz(n):\n+    return []\n*** End Patch"
+                        .to_string(),
+                ),
+                question: None,
+                error: None,
+                diagnostics: vec![
+                    "Context files were truncated to 32768 bytes before delegation."
+                        .to_string(),
+                ],
             },
         );
 
         assert_eq!(response.success, true);
+        let [codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text }] =
+            response.content_items.as_slice()
+        else {
+            panic!("expected a single text output item");
+        };
+        let result: serde_json::Value =
+            serde_json::from_str(text).expect("patch candidate should serialize as json");
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["format"], "apply_patch");
+        assert_eq!(result["summary"], "Implement fizzbuzz");
         assert_eq!(
-            response.content_items,
-            vec![
-                codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
-                    text: "Note: context files were truncated to 32768 bytes before delegation."
-                        .to_string(),
-                },
-                codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
-                    text: "def fizzbuzz(n):\n    return []".to_string(),
-                },
-            ]
+            result["patch"],
+            "*** Begin Patch\n*** Add File: fizzbuzz.py\n+def fizzbuzz(n):\n+    return []\n*** End Patch"
+        );
+        assert_eq!(
+            result["diagnostics"],
+            serde_json::json!(["Context files were truncated to 32768 bytes before delegation."])
         );
     }
 }

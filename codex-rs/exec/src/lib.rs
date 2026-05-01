@@ -916,6 +916,18 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 }
 
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
+    let dynamic_tools = codex_core::is_delegate_to_minimax_available(config.codex_home.as_path())
+        .then(|| {
+            let tool = codex_core::delegate_to_minimax_dynamic_tool();
+            vec![codex_app_server_protocol::DynamicToolSpec {
+                namespace: tool.namespace,
+                name: tool.name,
+                description: tool.description,
+                input_schema: tool.input_schema,
+                defer_loading: tool.defer_loading,
+            }]
+        });
+
     ThreadStartParams {
         model: config.model.clone(),
         model_provider: Some(config.model_provider_id.clone()),
@@ -925,6 +937,7 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
         sandbox: None,
         permission_profile: Some(config.permissions.permission_profile().into()),
         config: config_request_overrides_from_config(config),
+        dynamic_tools,
         ephemeral: Some(config.ephemeral),
         ..ThreadStartParams::default()
     }

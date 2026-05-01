@@ -1,4 +1,7 @@
 use super::*;
+use codex_config::types::AuthCredentialsStoreMode;
+use codex_login::ProviderCredentials;
+use codex_login::save_provider_credentials;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_utils_absolute_path::test_support::PathBufExt;
@@ -8,13 +11,67 @@ use opentelemetry::trace::TraceId;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use pretty_assertions::assert_eq;
+use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use tempfile::tempdir;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+static MINIMAX_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn test_tracing_subscriber() -> impl tracing::Subscriber + Send + Sync {
     let provider = SdkTracerProvider::builder().build();
     let tracer = provider.tracer("codex-exec-tests");
     tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer))
+}
+
+fn save_minimax_credentials(codex_home: &std::path::Path) {
+    save_provider_credentials(
+        codex_home,
+        AuthCredentialsStoreMode::File,
+        "minimax",
+        ProviderCredentials {
+            api_key: "minimax-file-token".to_string(),
+            kind: Some("coding_plan".to_string()),
+            last_verified: None,
+        },
+    )
+    .expect("save minimax credentials");
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &OsStr) -> Self {
+        let original = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+
+    fn clear(key: &'static str) -> Self {
+        let original = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 }
 
 #[test]
@@ -389,6 +446,93 @@ async fn thread_start_params_include_review_policy_when_auto_review_is_enabled()
         params.approvals_reviewer,
         Some(codex_app_server_protocol::ApprovalsReviewer::AutoReview)
     );
+}
+
+#[tokio::test]
+async fn thread_start_params_include_delegate_tool_when_minimax_credentials_exist() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    save_minimax_credentials(codex_home.path());
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config with minimax credentials");
+
+    let params = thread_start_params_from_config(&config);
+    let dynamic_tools = params
+        .dynamic_tools
+        .expect("delegate_to_minimax should be registered");
+
+    assert_eq!(dynamic_tools.len(), 1);
+    assert_eq!(dynamic_tools[0].name, "delegate_to_minimax");
+}
+
+#[tokio::test]
+async fn thread_start_params_include_delegate_tool_when_minimax_api_key_env_exists() {
+    let _lock = MINIMAX_ENV_LOCK.lock().expect("lock minimax env");
+    let _minimax_api_key = EnvVarGuard::set("MINIMAX_API_KEY", OsStr::new("test-key"));
+    let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config with minimax env credentials");
+
+    let params = thread_start_params_from_config(&config);
+    let dynamic_tools = params
+        .dynamic_tools
+        .expect("delegate_to_minimax should be registered");
+
+    assert_eq!(dynamic_tools.len(), 1);
+    assert_eq!(dynamic_tools[0].name, "delegate_to_minimax");
+}
+
+#[tokio::test]
+async fn thread_start_params_include_delegate_tool_when_minimax_coding_plan_env_exists() {
+    let _lock = MINIMAX_ENV_LOCK.lock().expect("lock minimax env");
+    let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
+    let _minimax_coding_plan_key =
+        EnvVarGuard::set("MINIMAX_CODING_PLAN_KEY", OsStr::new("test-plan-key"));
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config with minimax coding-plan env credentials");
+
+    let params = thread_start_params_from_config(&config);
+    let dynamic_tools = params
+        .dynamic_tools
+        .expect("delegate_to_minimax should be registered");
+
+    assert_eq!(dynamic_tools.len(), 1);
+    assert_eq!(dynamic_tools[0].name, "delegate_to_minimax");
+}
+
+#[tokio::test]
+async fn thread_start_params_omit_delegate_tool_without_minimax_credentials() {
+    let _lock = MINIMAX_ENV_LOCK.lock().expect("lock minimax env");
+    let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
+    let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config without minimax credentials");
+
+    let params = thread_start_params_from_config(&config);
+
+    assert_eq!(params.dynamic_tools, None);
 }
 
 #[test]

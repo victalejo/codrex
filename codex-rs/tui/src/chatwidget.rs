@@ -4510,13 +4510,7 @@ impl ChatWidget {
         content_items: Vec<codex_app_server_protocol::DynamicToolCallOutputContentItem>,
         duration: Duration,
     ) {
-        let clarification_requested = content_items.iter().any(|item| {
-            matches!(
-                item,
-                codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text }
-                    if text.trim_start().starts_with("CLARIFY:")
-            )
-        });
+        let delegate_outcome = crate::history_cell::delegate_to_minimax_outcome(&content_items);
         self.flush_answer_stream_with_separator();
         let mut handled = false;
         if let Some(cell) = self
@@ -4540,14 +4534,20 @@ impl ChatWidget {
         }
 
         self.bottom_pane.ensure_status_indicator();
-        if success {
-            self.set_status_header(format!(
-                "MiniMax completed in {}",
-                crate::status_indicator_widget::fmt_elapsed_compact(duration.as_secs())
-            ));
-        } else if clarification_requested {
+        if delegate_outcome == Some(crate::history_cell::DelegateToMiniMaxOutcome::Clarify) {
             self.set_status_header(format!(
                 "MiniMax requested clarification after {}",
+                crate::status_indicator_widget::fmt_elapsed_compact(duration.as_secs())
+            ));
+        } else if delegate_outcome == Some(crate::history_cell::DelegateToMiniMaxOutcome::Invalid)
+        {
+            self.set_status_header(format!(
+                "MiniMax needs attention after {}",
+                crate::status_indicator_widget::fmt_elapsed_compact(duration.as_secs())
+            ));
+        } else if success {
+            self.set_status_header(format!(
+                "MiniMax completed in {}",
                 crate::status_indicator_widget::fmt_elapsed_compact(duration.as_secs())
             ));
         } else {

@@ -1,9 +1,6 @@
 use crate::client_common::Prompt;
 use codex_api::ResponseEvent;
-use codex_config::types::AuthCredentialsStoreMode;
-use codex_minimax::AuthPreference;
-use codex_minimax::resolve_auth_from_env;
-use codex_model_provider_info::MINIMAX_PROVIDER_ID;
+use codex_apply_patch::parse_patch;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::error::CodexErr;
@@ -28,7 +25,7 @@ const DELEGATE_TO_MINIMAX_DEVELOPER_INSTRUCTIONS: &str = r#"You have access to d
 
 USE IT WHEN:
 - Implementing a clearly-specified function (you know signature, inputs, outputs, expected behavior)
-- Writing unit tests for code you've already analyzed
+- Writing or updating unit tests for code you've already analyzed
 - Mechanical refactoring (rename, extract method, format conversion)
 - Code translation between languages with clear mapping
 - Repetitive boilerplate (CRUD endpoints, similar test cases)
@@ -47,10 +44,14 @@ WORKFLOW:
 3. If yes: call delegate_to_minimax with:
    - task_description: a clear, complete description
    - acceptance_criteria: specific requirements the output must satisfy
-   - context_files: optional file paths whose content provides context
-4. The worker returns text output
+   - context_files: the most relevant files when you already know which code the worker should edit or test against
+4. The worker returns structured JSON:
+   - completed: `{"status":"completed","format":"apply_patch"|"unified_diff","summary":"...","patch":"..."}`
+   - clarify: `CLARIFY: <question>`
+   - invalid worker output is returned to you as a structured error result
 5. Evaluate that output before applying it:
-   - If satisfactory: use apply_patch to commit it
+   - Review the patch before applying it
+   - If satisfactory: apply it yourself with the normal Codex tools
    - If unclear or wrong: refine the criteria and call the tool again, or do it yourself
    - If the worker responded with CLARIFY:, refine the task and retry
 
@@ -61,10 +62,17 @@ const MINIMAX_DELEGATE_SYSTEM_PROMPT: &str = r#"You are MiniMax-M2.7, a delegate
 You are only handling bounded mechanical implementation work delegated by a primary model.
 Complete the requested implementation directly when the task is clear.
 
-If the task is ambiguous or missing critical information needed to proceed safely, respond with `CLARIFY:` followed by exactly one concrete question.
+If the task is ambiguous or missing critical information needed to proceed safely, respond exactly with `CLARIFY: <question>`.
+If the task is clear, respond with exactly one JSON object and nothing else:
+{"status":"completed","format":"apply_patch","summary":"<brief summary>","patch":"*** Begin Patch\n...\n*** End Patch"}
+
+Use `apply_patch` whenever possible. Only use `unified_diff` when `apply_patch` is not practical.
+The summary must be brief and factual.
+The patch must be valid for the declared format.
 Do not invent missing requirements.
+Do not invent files, APIs, or symbols when the provided context is insufficient.
 Do not describe approval gates, terminal commands, or filesystem mutations.
-Return the requested code or patch-ready text directly. Keep commentary brief unless it materially helps the caller evaluate the result."#;
+Do not include markdown fences, prose, or explanations outside the required JSON object."#;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DelegateToMinimaxRequest {
@@ -75,25 +83,102 @@ pub struct DelegateToMinimaxRequest {
     pub context_files: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DelegateToMinimaxResponse {
-    Completed {
-        output: String,
-        context_truncated: bool,
-    },
-    Clarify {
-        question: String,
-        context_truncated: bool,
-    },
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MiniMaxDelegationStatus {
+    Completed,
+    Clarify,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerPatchFormat {
+    ApplyPatch,
+    UnifiedDiff,
+}
+
+impl WorkerPatchFormat {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::ApplyPatch => "apply_patch",
+            Self::UnifiedDiff => "unified_diff",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MiniMaxDelegationResult {
+    pub status: MiniMaxDelegationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<WorkerPatchFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+pub type DelegateToMinimaxResponse = MiniMaxDelegationResult;
+
+impl MiniMaxDelegationResult {
+    fn completed(
+        format: WorkerPatchFormat,
+        summary: String,
+        patch: String,
+        diagnostics: Vec<String>,
+    ) -> Self {
+        Self {
+            status: MiniMaxDelegationStatus::Completed,
+            format: Some(format),
+            summary: Some(summary),
+            patch: Some(patch),
+            question: None,
+            error: None,
+            diagnostics,
+        }
+    }
+
+    fn clarify(question: String, diagnostics: Vec<String>) -> Self {
+        Self {
+            status: MiniMaxDelegationStatus::Clarify,
+            format: None,
+            summary: None,
+            patch: None,
+            question: Some(question),
+            error: None,
+            diagnostics,
+        }
+    }
+
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self::invalid_with_diagnostics(message.into(), Vec::new())
+    }
+
+    pub fn invalid_with_diagnostics(message: String, diagnostics: Vec<String>) -> Self {
+        Self {
+            status: MiniMaxDelegationStatus::Invalid,
+            format: None,
+            summary: None,
+            patch: None,
+            question: None,
+            error: Some(message),
+            diagnostics,
+        }
+    }
 }
 
 pub fn delegate_to_minimax_dynamic_tool() -> DynamicToolSpec {
     DynamicToolSpec {
         namespace: None,
         name: DELEGATE_TO_MINIMAX_TOOL_NAME.to_string(),
-        description:
-            "Delegate a mechanical implementation task to MiniMax-M2.7, a faster cheaper worker model."
-                .to_string(),
+        description: "Delegate a bounded implementation task to MiniMax-M2.7. Returns JSON with status plus a reviewable patch candidate."
+            .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -109,7 +194,7 @@ pub fn delegate_to_minimax_dynamic_tool() -> DynamicToolSpec {
                 "context_files": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional file paths whose content provides context"
+                    "description": "Optional file paths whose content gives the worker the exact code context it should edit or test against"
                 }
             },
             "required": ["task_description"]
@@ -119,15 +204,7 @@ pub fn delegate_to_minimax_dynamic_tool() -> DynamicToolSpec {
 }
 
 pub fn is_delegate_to_minimax_available(codex_home: &Path) -> bool {
-    resolve_auth_from_env(AuthPreference::default()).is_ok()
-        || codex_login::load_provider_credentials(
-            codex_home,
-            AuthCredentialsStoreMode::Auto,
-            MINIMAX_PROVIDER_ID,
-        )
-        .ok()
-        .flatten()
-        .is_some()
+    crate::minimax_adapter::has_minimax_credentials(codex_home)
 }
 
 pub(crate) fn delegate_to_minimax_developer_instructions(
@@ -142,6 +219,7 @@ pub(crate) fn delegate_to_minimax_developer_instructions(
 pub async fn delegate_to_minimax(
     request: DelegateToMinimaxRequest,
     cwd: &Path,
+    codex_home: &Path,
 ) -> CodexResult<DelegateToMinimaxResponse> {
     let (context_files, context_truncated) = load_context_files(cwd, &request.context_files)?;
 
@@ -162,34 +240,17 @@ pub async fn delegate_to_minimax(
 
     let mut provider = ModelProviderInfo::create_minimax_provider();
     provider.base_url = None;
-    let mut stream = crate::minimax_adapter::stream_chat_completions(
+    let mut stream = crate::minimax_adapter::stream_chat_completions_with_codex_home(
         &provider,
         &prompt,
         MINIMAX_DELEGATE_MODEL,
         reqwest::Client::new(),
+        codex_home,
     )
     .await?;
 
     let output = collect_stream_text(&mut stream).await?;
-    let output = output.trim_end().to_string();
-    if output.is_empty() {
-        return Err(CodexErr::UnsupportedOperation(
-            "MiniMax returned no text output for delegate_to_minimax".to_string(),
-        ));
-    }
-
-    let trimmed = output.trim_start();
-    if let Some(question) = trimmed.strip_prefix(CLARIFY_PREFIX) {
-        return Ok(DelegateToMinimaxResponse::Clarify {
-            question: question.trim().to_string(),
-            context_truncated,
-        });
-    }
-
-    Ok(DelegateToMinimaxResponse::Completed {
-        output,
-        context_truncated,
-    })
+    Ok(parse_delegate_output(output.as_str(), context_truncated))
 }
 
 struct ContextFileSnippet {
@@ -285,11 +346,171 @@ fn render_delegate_request(
     }
 
     let _ = writeln!(text);
+    let _ = writeln!(text, "Return contract:");
     let _ = writeln!(
         text,
-        "If you need clarification before proceeding, respond with `CLARIFY:` followed by one question."
+        "- If the task is clear, return exactly one JSON object with fields `status`, `format`, `summary`, and `patch`."
+    );
+    let _ = writeln!(
+        text,
+        "- Use `format: \"apply_patch\"` whenever possible. Only use `\"unified_diff\"` when needed."
+    );
+    let _ = writeln!(
+        text,
+        "- Do not include markdown fences or any prose outside the JSON object."
+    );
+    let _ = writeln!(
+        text,
+        "- If you need clarification before proceeding, respond exactly with `CLARIFY: <question>`."
     );
     text
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWorkerPatchCandidate {
+    status: MiniMaxDelegationStatus,
+    format: WorkerPatchFormat,
+    summary: String,
+    patch: String,
+}
+
+fn parse_delegate_output(output: &str, context_truncated: bool) -> DelegateToMinimaxResponse {
+    let trimmed = output.trim();
+    let diagnostics = context_truncation_diagnostics(context_truncated);
+
+    if trimmed.is_empty() {
+        return MiniMaxDelegationResult::invalid_with_diagnostics(
+            "MiniMax returned no output for delegate_to_minimax.".to_string(),
+            diagnostics,
+        );
+    }
+
+    if let Some(question) = trimmed.strip_prefix(CLARIFY_PREFIX) {
+        return MiniMaxDelegationResult::clarify(question.trim().to_string(), diagnostics);
+    }
+
+    let candidate = match serde_json::from_str::<RawWorkerPatchCandidate>(trimmed) {
+        Ok(candidate) => candidate,
+        Err(_) => {
+            if let Some(format) = detect_patch_format(trimmed) {
+                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                    format!(
+                        "MiniMax returned a raw {} patch instead of the required JSON object.",
+                        format.as_str()
+                    ),
+                    diagnostics,
+                );
+            }
+
+            return MiniMaxDelegationResult::invalid_with_diagnostics(
+                "MiniMax returned invalid output: expected JSON patch candidate or `CLARIFY: <question>`."
+                    .to_string(),
+                diagnostics,
+            );
+        }
+    };
+
+    if candidate.status != MiniMaxDelegationStatus::Completed {
+        return MiniMaxDelegationResult::invalid_with_diagnostics(
+            format!(
+                "MiniMax returned status `{}` in JSON, but only `completed` is valid for patch candidates.",
+                candidate_status_name(&candidate.status)
+            ),
+            diagnostics,
+        );
+    }
+
+    let summary = candidate.summary.trim().to_string();
+    if summary.is_empty() {
+        return MiniMaxDelegationResult::invalid_with_diagnostics(
+            "MiniMax returned a patch candidate without a summary.".to_string(),
+            diagnostics,
+        );
+    }
+
+    let patch = candidate.patch.trim().to_string();
+    if patch.is_empty() {
+        return MiniMaxDelegationResult::invalid_with_diagnostics(
+            "MiniMax returned a patch candidate without patch content.".to_string(),
+            diagnostics,
+        );
+    }
+
+    if let Err(error) = validate_patch_candidate(&candidate.format, patch.as_str()) {
+        let mut diagnostics = diagnostics;
+        diagnostics.push(error);
+        return MiniMaxDelegationResult::invalid_with_diagnostics(
+            format!(
+                "MiniMax returned an invalid {} patch candidate.",
+                candidate.format.as_str()
+            ),
+            diagnostics,
+        );
+    }
+
+    MiniMaxDelegationResult::completed(candidate.format, summary, patch, diagnostics)
+}
+
+fn validate_patch_candidate(format: &WorkerPatchFormat, patch: &str) -> Result<(), String> {
+    match format {
+        WorkerPatchFormat::ApplyPatch => {
+            let parsed = parse_patch(patch)
+                .map_err(|err| format!("apply_patch validation failed: {err}"))?;
+            if parsed.hunks.is_empty() {
+                return Err(
+                    "apply_patch validation failed: patch contained no file operations."
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        WorkerPatchFormat::UnifiedDiff => {
+            let has_diff_header = patch.contains("diff --git");
+            let has_file_headers = patch.contains("--- ") && patch.contains("+++ ");
+            let has_hunk = patch.contains("@@");
+            if has_diff_header || has_file_headers || has_hunk {
+                Ok(())
+            } else {
+                Err("unified diff validation failed: expected `diff --git`, `---`/`+++`, or `@@` markers.".to_string())
+            }
+        }
+    }
+}
+
+fn detect_patch_format(output: &str) -> Option<WorkerPatchFormat> {
+    if let Ok(parsed) = parse_patch(output)
+        && !parsed.hunks.is_empty()
+    {
+        return Some(WorkerPatchFormat::ApplyPatch);
+    }
+
+    let has_diff_header = output.contains("diff --git");
+    let has_file_headers = output.contains("--- ") && output.contains("+++ ");
+    let has_hunk = output.contains("@@");
+    if has_diff_header || has_file_headers || has_hunk {
+        Some(WorkerPatchFormat::UnifiedDiff)
+    } else {
+        None
+    }
+}
+
+fn context_truncation_diagnostics(context_truncated: bool) -> Vec<String> {
+    if context_truncated {
+        vec![format!(
+            "Context files were truncated to {CONTEXT_FILES_MAX_BYTES} bytes before delegation."
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+fn candidate_status_name(status: &MiniMaxDelegationStatus) -> &'static str {
+    match status {
+        MiniMaxDelegationStatus::Completed => "completed",
+        MiniMaxDelegationStatus::Clarify => "clarify",
+        MiniMaxDelegationStatus::Invalid => "invalid",
+    }
 }
 
 async fn collect_stream_text(
@@ -326,6 +547,8 @@ mod tests {
     use codex_login::save_provider_credentials;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
+    use std::ffi::OsStr;
+    use std::ffi::OsString;
     use tempfile::TempDir;
     use wiremock::MockServer;
     use wiremock::matchers::method;
@@ -333,11 +556,14 @@ mod tests {
 
     use super::CONTEXT_FILES_MAX_BYTES;
     use super::DelegateToMinimaxRequest;
-    use super::DelegateToMinimaxResponse;
+    use super::MiniMaxDelegationResult;
+    use super::MiniMaxDelegationStatus;
+    use super::WorkerPatchFormat;
     use super::delegate_to_minimax;
     use super::delegate_to_minimax_developer_instructions;
     use super::delegate_to_minimax_dynamic_tool;
     use super::is_delegate_to_minimax_available;
+    use super::parse_delegate_output;
 
     fn nonstreaming_chat_response_body(content: &str) -> String {
         let content = serde_json::to_string(content).expect("serialize content");
@@ -388,6 +614,108 @@ mod tests {
         .expect("save minimax credentials");
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &OsStr) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+
+        fn clear(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_delegate_output_returns_completed_patch_candidate() {
+        let result = parse_delegate_output(
+            r#"{"status":"completed","format":"apply_patch","summary":"Implement validate_email","patch":"*** Begin Patch\n*** Add File: validate_email.py\n+def validate_email(value: str) -> bool:\n+    return \"@\" in value\n*** End Patch"}"#,
+            /*context_truncated*/ false,
+        );
+
+        assert_eq!(
+            result,
+            MiniMaxDelegationResult {
+                status: MiniMaxDelegationStatus::Completed,
+                format: Some(WorkerPatchFormat::ApplyPatch),
+                summary: Some("Implement validate_email".to_string()),
+                patch: Some(
+                    "*** Begin Patch\n*** Add File: validate_email.py\n+def validate_email(value: str) -> bool:\n+    return \"@\" in value\n*** End Patch".to_string()
+                ),
+                question: None,
+                error: None,
+                diagnostics: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_delegate_output_returns_clarify_response() {
+        let result = parse_delegate_output(
+            "CLARIFY: should I preserve the helper signature?",
+            /*context_truncated*/ false,
+        );
+
+        assert_eq!(
+            result,
+            MiniMaxDelegationResult {
+                status: MiniMaxDelegationStatus::Clarify,
+                format: None,
+                summary: None,
+                patch: None,
+                question: Some("should I preserve the helper signature?".to_string()),
+                error: None,
+                diagnostics: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_delegate_output_rejects_prose_without_patch() {
+        let result = parse_delegate_output(
+            "I updated the helper and added tests.",
+            /*context_truncated*/ false,
+        );
+
+        assert_eq!(
+            result,
+            MiniMaxDelegationResult {
+                status: MiniMaxDelegationStatus::Invalid,
+                format: None,
+                summary: None,
+                patch: None,
+                question: None,
+                error: Some(
+                    "MiniMax returned invalid output: expected JSON patch candidate or `CLARIFY: <question>`."
+                        .to_string()
+                ),
+                diagnostics: Vec::new(),
+            }
+        );
+    }
+
     #[tokio::test]
     #[serial(env_minimax_delegate)]
     async fn delegate_to_minimax_returns_clarify_response() {
@@ -405,10 +733,8 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
         save_minimax_credentials(&temp_dir);
-        unsafe {
-            std::env::set_var("CODEX_HOME", temp_dir.path());
-            std::env::set_var("MINIMAX_BASE_URL", format!("{}/v1", server.uri()));
-        }
+        let minimax_base_url = format!("{}/v1", server.uri());
+        let _minimax_base_url = EnvVarGuard::set("MINIMAX_BASE_URL", OsStr::new(&minimax_base_url));
 
         let result = delegate_to_minimax(
             DelegateToMinimaxRequest {
@@ -417,29 +743,33 @@ mod tests {
                 context_files: Vec::new(),
             },
             temp_dir.path(),
+            temp_dir.path(),
         )
         .await
         .expect("delegate call should succeed");
 
         assert_eq!(
             result,
-            DelegateToMinimaxResponse::Clarify {
-                question: "should I add property-based tests?".to_string(),
-                context_truncated: false,
+            MiniMaxDelegationResult {
+                status: MiniMaxDelegationStatus::Clarify,
+                format: None,
+                summary: None,
+                patch: None,
+                question: Some("should I add property-based tests?".to_string()),
+                error: None,
+                diagnostics: Vec::new(),
             }
         );
 
-        unsafe {
-            std::env::remove_var("CODEX_HOME");
-            std::env::remove_var("MINIMAX_BASE_URL");
-        }
     }
 
     #[tokio::test]
     #[serial(env_minimax_delegate)]
-    async fn delegate_to_minimax_reports_context_truncation() {
+    async fn delegate_to_minimax_returns_patch_candidate_with_truncation_diagnostic() {
         let server = MockServer::start().await;
-        let body = nonstreaming_chat_response_body("def fizzbuzz(n):\n    return []");
+        let body = nonstreaming_chat_response_body(
+            r#"{"status":"completed","format":"apply_patch","summary":"Implement fizzbuzz","patch":"*** Begin Patch\n*** Add File: fizzbuzz.py\n+def fizzbuzz(n: int) -> list[str]:\n+    return []\n*** End Patch"}"#,
+        );
         wiremock::Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(
@@ -455,10 +785,8 @@ mod tests {
         let context_path = temp_dir.path().join("big_context.py");
         std::fs::write(&context_path, "x".repeat(CONTEXT_FILES_MAX_BYTES + 128))
             .expect("write context file");
-        unsafe {
-            std::env::set_var("CODEX_HOME", temp_dir.path());
-            std::env::set_var("MINIMAX_BASE_URL", format!("{}/v1", server.uri()));
-        }
+        let minimax_base_url = format!("{}/v1", server.uri());
+        let _minimax_base_url = EnvVarGuard::set("MINIMAX_BASE_URL", OsStr::new(&minimax_base_url));
 
         let result = delegate_to_minimax(
             DelegateToMinimaxRequest {
@@ -467,22 +795,29 @@ mod tests {
                 context_files: vec!["big_context.py".to_string()],
             },
             temp_dir.path(),
+            temp_dir.path(),
         )
         .await
         .expect("delegate call should succeed");
 
         assert_eq!(
             result,
-            DelegateToMinimaxResponse::Completed {
-                output: "def fizzbuzz(n):\n    return []".to_string(),
-                context_truncated: true,
+            MiniMaxDelegationResult {
+                status: MiniMaxDelegationStatus::Completed,
+                format: Some(WorkerPatchFormat::ApplyPatch),
+                summary: Some("Implement fizzbuzz".to_string()),
+                patch: Some(
+                    "*** Begin Patch\n*** Add File: fizzbuzz.py\n+def fizzbuzz(n: int) -> list[str]:\n+    return []\n*** End Patch".to_string()
+                ),
+                question: None,
+                error: None,
+                diagnostics: vec![
+                    "Context files were truncated to 32768 bytes before delegation."
+                        .to_string()
+                ],
             }
         );
 
-        unsafe {
-            std::env::remove_var("CODEX_HOME");
-            std::env::remove_var("MINIMAX_BASE_URL");
-        }
     }
 
     #[test]
@@ -492,6 +827,37 @@ mod tests {
         save_minimax_credentials(&temp_dir);
 
         assert!(is_delegate_to_minimax_available(temp_dir.path()));
+    }
+
+    #[test]
+    #[serial(env_minimax_delegate)]
+    fn delegate_to_minimax_is_available_with_minimax_api_key_env() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _minimax_api_key = EnvVarGuard::set("MINIMAX_API_KEY", OsStr::new("test-key"));
+        let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
+
+        assert!(is_delegate_to_minimax_available(temp_dir.path()));
+    }
+
+    #[test]
+    #[serial(env_minimax_delegate)]
+    fn delegate_to_minimax_is_available_with_minimax_coding_plan_key_env() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
+        let _minimax_coding_plan_key =
+            EnvVarGuard::set("MINIMAX_CODING_PLAN_KEY", OsStr::new("test-coding-plan-key"));
+
+        assert!(is_delegate_to_minimax_available(temp_dir.path()));
+    }
+
+    #[test]
+    #[serial(env_minimax_delegate)]
+    fn delegate_to_minimax_is_unavailable_without_credentials() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
+        let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
+
+        assert!(!is_delegate_to_minimax_available(temp_dir.path()));
     }
 
     #[test]

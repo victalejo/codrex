@@ -83,6 +83,7 @@
 //! by a regression test will re-bite on resume, fork, or any future
 //! prompt-shape change.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -429,7 +430,23 @@ fn warn_lossy_tool(spec: &ToolSpec) {
 ///      auth credential store (Auto/File/Keyring/Ephemeral). Reads
 ///      whichever backend the user has configured for OpenAI auth.
 ///   4. A clear error pointing the user at `codrex login minimax`.
+pub(crate) fn has_minimax_credentials(codex_home: &Path) -> bool {
+    resolve_credentials_with_home(
+        &codex_model_provider_info::ModelProviderInfo::create_minimax_provider(),
+        Some(codex_home),
+    )
+    .is_ok()
+}
+
 fn resolve_credentials(provider: &ModelProviderInfo) -> Result<ResolvedAuth, CodexErr> {
+    let codex_home = codex_utils_home_dir::find_codex_home().ok();
+    resolve_credentials_with_home(provider, codex_home.as_deref())
+}
+
+fn resolve_credentials_with_home(
+    provider: &ModelProviderInfo,
+    codex_home: Option<&Path>,
+) -> Result<ResolvedAuth, CodexErr> {
     // 1. Provider-specific env var override (set in the provider config).
     if let Some(env_key) = provider.env_key.as_deref()
         && let Ok(value) = std::env::var(env_key)
@@ -454,7 +471,7 @@ fn resolve_credentials(provider: &ModelProviderInfo) -> Result<ResolvedAuth, Cod
     // the Auto store mode so credentials saved via `codrex login minimax`
     // (which honors the user's configured store backend) are visible
     // here regardless of where they actually live (file vs keyring).
-    if let Some(auth) = load_minimax_credentials_from_auth_file() {
+    if let Some(auth) = codex_home.and_then(load_minimax_credentials_from_auth_file) {
         return Ok(auth);
     }
 
@@ -472,10 +489,9 @@ fn resolve_credentials(provider: &ModelProviderInfo) -> Result<ResolvedAuth, Cod
 /// available. Returns `None` on any failure (missing home dir, missing
 /// or unparseable auth file, no provider entry) so the caller can move
 /// on to the explicit "no credentials" error message.
-fn load_minimax_credentials_from_auth_file() -> Option<ResolvedAuth> {
-    let codex_home = codex_utils_home_dir::find_codex_home().ok()?;
+fn load_minimax_credentials_from_auth_file(codex_home: &Path) -> Option<ResolvedAuth> {
     let creds = codex_login::load_provider_credentials(
-        codex_home.as_path(),
+        codex_home,
         codex_config::types::AuthCredentialsStoreMode::Auto,
         codex_minimax::MINIMAX_PROVIDER_ID,
     )
@@ -509,7 +525,31 @@ pub async fn stream_chat_completions(
     model: &str,
     http_client: reqwest::Client,
 ) -> CodexResult<ResponseStream> {
-    let auth = resolve_credentials(provider)?;
+    stream_chat_completions_with_home(provider, prompt, model, http_client, None).await
+}
+
+pub(crate) async fn stream_chat_completions_with_codex_home(
+    provider: &ModelProviderInfo,
+    prompt: &Prompt,
+    model: &str,
+    http_client: reqwest::Client,
+    codex_home: &Path,
+) -> CodexResult<ResponseStream> {
+    stream_chat_completions_with_home(provider, prompt, model, http_client, Some(codex_home))
+        .await
+}
+
+async fn stream_chat_completions_with_home(
+    provider: &ModelProviderInfo,
+    prompt: &Prompt,
+    model: &str,
+    http_client: reqwest::Client,
+    codex_home: Option<&Path>,
+) -> CodexResult<ResponseStream> {
+    let auth = match codex_home {
+        Some(codex_home) => resolve_credentials_with_home(provider, Some(codex_home))?,
+        None => resolve_credentials(provider)?,
+    };
     let base_url = resolve_provider_base_url(provider);
     let client = MinimaxClient::new(http_client, base_url, auth);
 

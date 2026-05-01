@@ -75,6 +75,9 @@ pub mod legacy_core {
     pub use codex_core::DelegateToMinimaxResponse;
     pub use codex_core::LOCAL_AGENTS_MD_FILENAME;
     pub use codex_core::McpManager;
+    pub use codex_core::MiniMaxDelegationResult;
+    pub use codex_core::MiniMaxDelegationStatus;
+    pub use codex_core::WorkerPatchFormat;
     pub use codex_core::append_message_history_entry;
     pub use codex_core::check_execpolicy_for_warnings;
     pub use codex_core::delegate_to_minimax;
