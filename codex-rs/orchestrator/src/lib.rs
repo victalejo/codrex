@@ -57,7 +57,6 @@ pub mod traits;
 
 pub use audit::PatternAuditor;
 pub use audit::PlaceholderAuditor;
-pub use classifier::CHATGPT_AUTH_DISABLED_REASON;
 pub use classifier::ClassificationTrace;
 pub use classifier::DEFAULT_LLM_FALLBACK_CACHE_SIZE;
 pub use classifier::DEFAULT_LLM_FALLBACK_MODEL;

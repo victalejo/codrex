@@ -8,7 +8,6 @@ use serde::Deserialize;
 
 mod llm;
 
-pub use llm::CHATGPT_AUTH_DISABLED_REASON;
 pub use llm::ClassificationTrace;
 pub use llm::DEFAULT_LLM_FALLBACK_CACHE_SIZE;
 pub use llm::DEFAULT_LLM_FALLBACK_MODEL;

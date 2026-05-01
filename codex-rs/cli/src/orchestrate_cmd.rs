@@ -399,13 +399,6 @@ fn build_llm_fallback_classifier(
         Ok(Some(auth)) => {
             match openai_fallback_availability(Some(&auth)) {
                 OpenAiFallbackAvailability::Enabled => {}
-                OpenAiFallbackAvailability::DisabledByChatgptAuth => {
-                    config.enabled = false;
-                    return Ok(
-                        LlmFallbackClassifier::new(Arc::new(DisabledLlmClient), config)
-                            .with_chatgpt_auth_disabled(),
-                    );
-                }
                 OpenAiFallbackAvailability::Unavailable => {
                     config.enabled = false;
                     return Ok(

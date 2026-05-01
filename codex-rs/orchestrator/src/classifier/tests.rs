@@ -1,4 +1,3 @@
-use crate::CHATGPT_AUTH_DISABLED_REASON;
 use crate::ClassificationOutcome;
 use crate::Classifier;
 use crate::LlmClassification;
@@ -580,58 +579,6 @@ fn resolve_passes_configured_model_through_unchanged() {
 }
 
 #[tokio::test]
-#[tracing_test::traced_test]
-#[serial]
-async fn chatgpt_auth_disables_llm_fallback_with_warning() {
-    super::llm::reset_llm_fallback_warning_state_for_tests();
-    let client = MockLlmClient::with_responses([]);
-    let classifier =
-        LlmFallbackClassifier::new(client.clone(), llm_config(false)).with_chatgpt_auth_disabled();
-
-    let trace = classifier.classify("convert this XML config to YAML").await;
-
-    let ClassificationOutcome::PassThrough { reason, rule_name } = &trace.outcome else {
-        panic!("expected pass-through outcome");
-    };
-    assert_eq!(
-        reason,
-        &format!("no rule matched + {CHATGPT_AUTH_DISABLED_REASON}")
-    );
-    assert_eq!(rule_name, &None);
-    assert_eq!(trace.llm_error, None);
-    assert_eq!(client.call_count(), 0);
-    assert!(logs_contain("LLM fallback classifier disabled"));
-    assert!(logs_contain("auth_mode=\"chatgpt\""));
-}
-
-#[tokio::test]
-#[tracing_test::traced_test]
-#[serial]
-async fn chatgpt_auth_warning_emitted_only_once() {
-    super::llm::reset_llm_fallback_warning_state_for_tests();
-    let client = MockLlmClient::with_responses([]);
-    let classifier =
-        LlmFallbackClassifier::new(client, llm_config(false)).with_chatgpt_auth_disabled();
-
-    let _ = classifier.classify("convert this XML config to YAML").await;
-    let _ = classifier
-        .classify("explain why my coworker disagrees")
-        .await;
-
-    logs_assert(|lines: &[&str]| {
-        let count = lines
-            .iter()
-            .filter(|line| line.contains("LLM fallback classifier disabled"))
-            .count();
-        if count == 1 {
-            Ok(())
-        } else {
-            Err(format!("expected exactly one warning, got {count}"))
-        }
-    });
-}
-
-#[tokio::test]
 async fn apikey_auth_keeps_llm_fallback_enabled() {
     let temp = TempDir::new().unwrap();
     write_auth_json(
@@ -676,7 +623,6 @@ async fn apikey_auth_keeps_llm_fallback_enabled() {
 #[tracing_test::traced_test]
 #[serial]
 async fn no_credentials_disables_silently() {
-    super::llm::reset_llm_fallback_warning_state_for_tests();
     let client = MockLlmClient::with_responses([]);
     let classifier = LlmFallbackClassifier::new(client.clone(), llm_config(false))
         .with_disabled_reason("no openai credentials configured");
@@ -703,7 +649,6 @@ async fn no_credentials_disables_silently() {
 #[tracing_test::traced_test]
 #[serial]
 async fn no_credentials_uses_distinctive_disabled_reason_in_jsonl() {
-    super::llm::reset_llm_fallback_warning_state_for_tests();
     let client = MockLlmClient::with_responses([]);
     let classifier = LlmFallbackClassifier::new(client.clone(), llm_config(false))
         .with_disabled_reason("no openai credentials configured");
