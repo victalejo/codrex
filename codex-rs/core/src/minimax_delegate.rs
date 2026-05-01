@@ -3,7 +3,6 @@ use codex_api::ResponseEvent;
 use codex_apply_patch::parse_patch;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
-use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -14,6 +13,13 @@ use serde::Serialize;
 use serde_json::json;
 use std::fmt::Write;
 use std::path::Path;
+
+mod context_packer;
+mod git_status;
+use context_packer::ContextPack;
+use context_packer::ContextPackRequest;
+use context_packer::ContextPacker;
+use context_packer::DEFAULT_CONTEXT_FILE_MAX_BYTES;
 
 pub const DELEGATE_TO_MINIMAX_TOOL_NAME: &str = "delegate_to_minimax";
 pub const CONTEXT_FILES_MAX_BYTES: usize = 32 * 1024;
@@ -44,16 +50,19 @@ WORKFLOW:
 3. If yes: call delegate_to_minimax with:
    - task_description: a clear, complete description
    - acceptance_criteria: specific requirements the output must satisfy
-   - context_files: the most relevant files when you already know which code the worker should edit or test against
+   - context_files: the most relevant files when you already know which code the worker should edit or test against; the tool will safely inline, redact, and truncate them as needed
+   - include_modified_files: true only when the current worktree is directly relevant and you want the tool to safely inline a small bounded set of git-modified files using the same denylist, redaction, dedupe, and budget rules
+     - Good uses: continuing, fixing, or reviewing code that is likely already modified locally, especially when you do not yet know the exact context files to attach
+     - Do not use it for secrets, credentials, auth, tokens, or other sensitive local data; global architecture or repo-wide reasoning; when the user does not want to share local context with MiniMax; or when extra local context is unnecessary
 4. The worker returns structured JSON:
-   - completed: `{"status":"completed","format":"apply_patch"|"unified_diff","summary":"...","patch":"..."}`
-   - clarify: `CLARIFY: <question>`
-   - invalid worker output is returned to you as a structured error result
+   - completed: `{"status":"completed","format":"apply_patch"|"unified_diff","summary":"...","patch":"...","diagnostics":["..."]}`
+   - clarify: `{"status":"clarify","question":"...","diagnostics":["..."]}`
+   - invalid: `{"status":"invalid","error":"...","diagnostics":["..."]}`
 5. Evaluate that output before applying it:
-   - Review the patch before applying it
-   - If satisfactory: apply it yourself with the normal Codex tools
-   - If unclear or wrong: refine the criteria and call the tool again, or do it yourself
-   - If the worker responded with CLARIFY:, refine the task and retry
+   - If `status=completed`: review the patch before applying it, then apply it yourself with the normal Codex tools only if it looks correct
+   - If `status=clarify`: do not apply anything; ask the user or gather the missing file/context, then retry only after you have new information
+   - If `status=invalid`: do not apply anything; if the error is invalid format you may retry once with stricter instructions, and if the error is insufficient context you should attach the relevant files before retrying
+   - Avoid indefinite retry loops; if one retry does not fix the issue, either gather better context or do the work yourself
 
 The user may see the worker output in tool history. You are responsible for evaluating quality before applying it."#;
 
@@ -62,17 +71,26 @@ const MINIMAX_DELEGATE_SYSTEM_PROMPT: &str = r#"You are MiniMax-M2.7, a delegate
 You are only handling bounded mechanical implementation work delegated by a primary model.
 Complete the requested implementation directly when the task is clear.
 
-If the task is ambiguous or missing critical information needed to proceed safely, respond exactly with `CLARIFY: <question>`.
-If the task is clear, respond with exactly one JSON object and nothing else:
-{"status":"completed","format":"apply_patch","summary":"<brief summary>","patch":"*** Begin Patch\n...\n*** End Patch"}
+Return exactly one JSON object and nothing else.
 
-Use `apply_patch` whenever possible. Only use `unified_diff` when `apply_patch` is not practical.
-The summary must be brief and factual.
-The patch must be valid for the declared format.
-Do not invent missing requirements.
-Do not invent files, APIs, or symbols when the provided context is insufficient.
-Do not describe approval gates, terminal commands, or filesystem mutations.
-Do not include markdown fences, prose, or explanations outside the required JSON object."#;
+Allowed responses:
+{"status":"completed","format":"apply_patch","summary":"<brief summary>","patch":"*** Begin Patch\n...\n*** End Patch","diagnostics":["optional diagnostics"]}
+{"status":"clarify","question":"<question>","diagnostics":["optional diagnostics"]}
+{"status":"invalid","error":"<brief reason>","diagnostics":["optional diagnostics"]}
+
+Rules:
+- Use only the provided context.
+- Some context files may have been included because they are currently modified in git; treat them as local-state hints, not proof that you saw the whole repository.
+- Do not assume you saw the entire repository.
+- Do not invent files that are not shown, unless creating a new file is explicitly necessary to complete the requested change.
+- If critical context is missing, truncated, or ambiguous, respond with `status":"clarify"` instead of guessing.
+- Use `status":"invalid"` when the request or available context is not actionable as given and needs the supervisor to retry differently.
+- Use `apply_patch` whenever possible. Only use `unified_diff` when `apply_patch` is not practical.
+- The summary must be brief and factual.
+- The patch must be valid for the declared format.
+- Do not invent missing requirements, APIs, or symbols.
+- Do not describe approval gates, terminal commands, or filesystem mutations.
+- Do not include markdown fences, prose, or explanations outside the required JSON object."#;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DelegateToMinimaxRequest {
@@ -81,6 +99,8 @@ pub struct DelegateToMinimaxRequest {
     pub acceptance_criteria: Vec<String>,
     #[serde(default)]
     pub context_files: Vec<String>,
+    #[serde(default)]
+    pub include_modified_files: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -195,6 +215,10 @@ pub fn delegate_to_minimax_dynamic_tool() -> DynamicToolSpec {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional file paths whose content gives the worker the exact code context it should edit or test against"
+                },
+                "include_modified_files": {
+                    "type": "boolean",
+                    "description": "Optional opt-in to also attach a small bounded set of modified tracked files from git status using the same denylist, redaction, dedupe, and budget rules"
                 }
             },
             "required": ["task_description"]
@@ -221,7 +245,22 @@ pub async fn delegate_to_minimax(
     cwd: &Path,
     codex_home: &Path,
 ) -> CodexResult<DelegateToMinimaxResponse> {
-    let (context_files, context_truncated) = load_context_files(cwd, &request.context_files)?;
+    let context_packer =
+        ContextPacker::new(cwd, CONTEXT_FILES_MAX_BYTES, DEFAULT_CONTEXT_FILE_MAX_BYTES);
+    let context_pack = if request.include_modified_files {
+        context_packer.pack_with_request(ContextPackRequest {
+            explicit_files: &request.context_files,
+            explicit_snippets: &[],
+            task_text: request.task_description.as_str(),
+            include_modified_files: true,
+        })
+    } else {
+        context_packer.pack(
+            &request.context_files,
+            &[],
+            request.task_description.as_str(),
+        )
+    };
 
     let mut prompt = Prompt {
         base_instructions: BaseInstructions {
@@ -233,7 +272,7 @@ pub async fn delegate_to_minimax(
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
-            text: render_delegate_request(&request, &context_files, context_truncated),
+            text: render_delegate_request(&request, &context_pack),
         }],
         phase: None,
     });
@@ -250,68 +289,15 @@ pub async fn delegate_to_minimax(
     .await?;
 
     let output = collect_stream_text(&mut stream).await?;
-    Ok(parse_delegate_output(output.as_str(), context_truncated))
-}
-
-struct ContextFileSnippet {
-    path: String,
-    content: String,
-}
-
-fn load_context_files(
-    cwd: &Path,
-    context_files: &[String],
-) -> CodexResult<(Vec<ContextFileSnippet>, bool)> {
-    let mut remaining = CONTEXT_FILES_MAX_BYTES;
-    let mut truncated = false;
-    let mut snippets = Vec::with_capacity(context_files.len());
-
-    for (index, context_file) in context_files.iter().enumerate() {
-        if remaining == 0 {
-            truncated = true;
-            break;
-        }
-
-        let resolved_path = resolve_context_path(cwd, context_file);
-        let bytes = std::fs::read(&resolved_path).map_err(|err| {
-            CodexErr::UnsupportedOperation(format!(
-                "failed to read delegate context file `{context_file}`: {err}"
-            ))
-        })?;
-        let content = String::from_utf8_lossy(&bytes);
-        let truncated_content =
-            codex_utils_string::take_bytes_at_char_boundary(content.as_ref(), remaining);
-        if truncated_content.len() < content.len() {
-            truncated = true;
-        }
-        remaining = remaining.saturating_sub(truncated_content.len());
-        snippets.push(ContextFileSnippet {
-            path: context_file.clone(),
-            content: truncated_content.to_string(),
-        });
-
-        if remaining == 0 && index + 1 < context_files.len() {
-            truncated = true;
-            break;
-        }
-    }
-
-    Ok((snippets, truncated))
-}
-
-fn resolve_context_path(cwd: &Path, context_file: &str) -> std::path::PathBuf {
-    let path = Path::new(context_file);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    }
+    Ok(parse_delegate_output(
+        output.as_str(),
+        &context_pack.diagnostics.messages,
+    ))
 }
 
 fn render_delegate_request(
     request: &DelegateToMinimaxRequest,
-    context_files: &[ContextFileSnippet],
-    context_truncated: bool,
+    context_pack: &ContextPack,
 ) -> String {
     let mut text = String::new();
     let _ = writeln!(text, "Task description:");
@@ -325,31 +311,74 @@ fn render_delegate_request(
         }
     }
 
-    if !context_files.is_empty() {
+    if !context_pack.git_modified_paths.is_empty() {
         let _ = writeln!(text);
-        let _ = writeln!(text, "Context files:");
-        for snippet in context_files {
-            let _ = writeln!(text, "=== {} ===", snippet.path);
-            let _ = writeln!(text, "{}", snippet.content);
-            if !snippet.content.ends_with('\n') {
-                let _ = writeln!(text);
-            }
-        }
-    }
-
-    if context_truncated {
-        let _ = writeln!(text);
+        let _ = writeln!(text, "Git-modified context:");
         let _ = writeln!(
             text,
-            "Note: context files were truncated to {CONTEXT_FILES_MAX_BYTES} bytes total."
+            "- The following files were included because they are currently modified in git: {}.",
+            context_pack.git_modified_paths.join(", ")
+        );
+        let _ = writeln!(
+            text,
+            "- Do not assume this is a complete view of every changed file in the repository."
+        );
+    }
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "<context>");
+    for context_file in &context_pack.files {
+        let truncated = if context_file.truncated {
+            "true"
+        } else {
+            "false"
+        };
+        let _ = writeln!(
+            text,
+            r#"<file path="{}" truncated="{truncated}">"#,
+            context_file.path
+        );
+        let _ = write!(text, "{}", context_file.content);
+        if !context_file.content.ends_with('\n') {
+            let _ = writeln!(text);
+        }
+        let _ = writeln!(text, "</file>");
+        let _ = writeln!(text);
+    }
+    let _ = writeln!(text, "</context>");
+
+    if context_pack.truncated || !context_pack.diagnostics.messages.is_empty() {
+        let _ = writeln!(text);
+        let _ = writeln!(text, "Context note:");
+        let _ = writeln!(
+            text,
+            "- Some requested context was omitted, truncated, or redacted by safety and budget rules."
+        );
+        let _ = writeln!(
+            text,
+            "- If essential context is missing, respond with `status\":\"clarify\"` instead of guessing."
         );
     }
 
     let _ = writeln!(text);
     let _ = writeln!(text, "Return contract:");
+    let _ = writeln!(text, "- Return exactly one JSON object and nothing else.");
     let _ = writeln!(
         text,
-        "- If the task is clear, return exactly one JSON object with fields `status`, `format`, `summary`, and `patch`."
+        "- If the task is clear, return: {{\"status\":\"completed\",\"format\":\"apply_patch\"|\"unified_diff\",\"summary\":\"...\",\"patch\":\"...\",\"diagnostics\":[\"...\"]}}."
+    );
+    let _ = writeln!(
+        text,
+        "- If essential context is missing or ambiguous, return: {{\"status\":\"clarify\",\"question\":\"...\",\"diagnostics\":[\"...\"]}}."
+    );
+    let _ = writeln!(
+        text,
+        "- If the request is not actionable as given, return: {{\"status\":\"invalid\",\"error\":\"...\",\"diagnostics\":[\"...\"]}}."
+    );
+    let _ = writeln!(text, "- Use only the context provided above.");
+    let _ = writeln!(
+        text,
+        "- Do not invent files that are not shown above unless creating a new file is explicitly necessary."
     );
     let _ = writeln!(
         text,
@@ -359,41 +388,49 @@ fn render_delegate_request(
         text,
         "- Do not include markdown fences or any prose outside the JSON object."
     );
-    let _ = writeln!(
-        text,
-        "- If you need clarification before proceeding, respond exactly with `CLARIFY: <question>`."
-    );
     text
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawWorkerPatchCandidate {
+struct RawWorkerResponse {
     status: MiniMaxDelegationStatus,
-    format: WorkerPatchFormat,
-    summary: String,
-    patch: String,
+    #[serde(default)]
+    format: Option<WorkerPatchFormat>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    patch: Option<String>,
+    #[serde(default)]
+    question: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
     #[serde(default)]
     diagnostics: Vec<String>,
 }
 
-fn parse_delegate_output(output: &str, context_truncated: bool) -> DelegateToMinimaxResponse {
+fn parse_delegate_output(
+    output: &str,
+    context_diagnostics: &[String],
+) -> DelegateToMinimaxResponse {
     let trimmed = output.trim();
-    let context_diagnostics = context_truncation_diagnostics(context_truncated);
 
     if trimmed.is_empty() {
         return MiniMaxDelegationResult::invalid_with_diagnostics(
             "MiniMax returned no output for delegate_to_minimax.".to_string(),
-            context_diagnostics,
+            context_diagnostics.to_vec(),
         );
     }
 
     if let Some(question) = trimmed.strip_prefix(CLARIFY_PREFIX) {
-        return MiniMaxDelegationResult::clarify(question.trim().to_string(), context_diagnostics);
+        return MiniMaxDelegationResult::clarify(
+            question.trim().to_string(),
+            context_diagnostics.to_vec(),
+        );
     }
 
-    let candidate = match serde_json::from_str::<RawWorkerPatchCandidate>(trimmed) {
-        Ok(candidate) => candidate,
+    let response = match serde_json::from_str::<RawWorkerResponse>(trimmed) {
+        Ok(response) => response,
         Err(_) => {
             if let Some(format) = detect_patch_format(trimmed) {
                 return MiniMaxDelegationResult::invalid_with_diagnostics(
@@ -401,60 +438,81 @@ fn parse_delegate_output(output: &str, context_truncated: bool) -> DelegateToMin
                         "MiniMax returned a raw {} patch instead of the required JSON object.",
                         format.as_str()
                     ),
-                    context_diagnostics,
+                    context_diagnostics.to_vec(),
                 );
             }
 
             return MiniMaxDelegationResult::invalid_with_diagnostics(
-                "MiniMax returned invalid output: expected JSON patch candidate or `CLARIFY: <question>`."
+                "MiniMax returned invalid output: expected JSON with status `completed`, `clarify`, or `invalid`."
                     .to_string(),
-                context_diagnostics,
+                context_diagnostics.to_vec(),
             );
         }
     };
 
-    let mut diagnostics = context_diagnostics;
-    diagnostics.extend(candidate.diagnostics.iter().cloned());
+    let mut diagnostics = context_diagnostics.to_vec();
+    diagnostics.extend(response.diagnostics.iter().cloned());
 
-    if candidate.status != MiniMaxDelegationStatus::Completed {
-        return MiniMaxDelegationResult::invalid_with_diagnostics(
-            format!(
-                "MiniMax returned status `{}` in JSON, but only `completed` is valid for patch candidates.",
-                candidate_status_name(&candidate.status)
-            ),
-            diagnostics,
-        );
+    match response.status {
+        MiniMaxDelegationStatus::Completed => {
+            let Some(format) = response.format else {
+                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                    "MiniMax returned status `completed` without a patch format.".to_string(),
+                    diagnostics,
+                );
+            };
+
+            let summary = response.summary.unwrap_or_default().trim().to_string();
+            if summary.is_empty() {
+                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                    "MiniMax returned a patch candidate without a summary.".to_string(),
+                    diagnostics,
+                );
+            }
+
+            let patch = response.patch.unwrap_or_default().trim().to_string();
+            if patch.is_empty() {
+                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                    "MiniMax returned a patch candidate without patch content.".to_string(),
+                    diagnostics,
+                );
+            }
+
+            if let Err(error) = validate_patch_candidate(&format, patch.as_str()) {
+                let mut diagnostics = diagnostics;
+                diagnostics.push(error);
+                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                    format!(
+                        "MiniMax returned an invalid {} patch candidate.",
+                        format.as_str()
+                    ),
+                    diagnostics,
+                );
+            }
+
+            MiniMaxDelegationResult::completed(format, summary, patch, diagnostics)
+        }
+        MiniMaxDelegationStatus::Clarify => {
+            let question = response.question.unwrap_or_default().trim().to_string();
+            if question.is_empty() {
+                return MiniMaxDelegationResult::invalid_with_diagnostics(
+                    "MiniMax returned status `clarify` without a question.".to_string(),
+                    diagnostics,
+                );
+            }
+
+            MiniMaxDelegationResult::clarify(question, diagnostics)
+        }
+        MiniMaxDelegationStatus::Invalid => {
+            let error = response.error.unwrap_or_default().trim().to_string();
+            let error = if error.is_empty() {
+                "MiniMax returned status `invalid` without an error message.".to_string()
+            } else {
+                error
+            };
+            MiniMaxDelegationResult::invalid_with_diagnostics(error, diagnostics)
+        }
     }
-
-    let summary = candidate.summary.trim().to_string();
-    if summary.is_empty() {
-        return MiniMaxDelegationResult::invalid_with_diagnostics(
-            "MiniMax returned a patch candidate without a summary.".to_string(),
-            diagnostics,
-        );
-    }
-
-    let patch = candidate.patch.trim().to_string();
-    if patch.is_empty() {
-        return MiniMaxDelegationResult::invalid_with_diagnostics(
-            "MiniMax returned a patch candidate without patch content.".to_string(),
-            diagnostics,
-        );
-    }
-
-    if let Err(error) = validate_patch_candidate(&candidate.format, patch.as_str()) {
-        let mut diagnostics = diagnostics;
-        diagnostics.push(error);
-        return MiniMaxDelegationResult::invalid_with_diagnostics(
-            format!(
-                "MiniMax returned an invalid {} patch candidate.",
-                candidate.format.as_str()
-            ),
-            diagnostics,
-        );
-    }
-
-    MiniMaxDelegationResult::completed(candidate.format, summary, patch, diagnostics)
 }
 
 fn validate_patch_candidate(format: &WorkerPatchFormat, patch: &str) -> Result<(), String> {
@@ -500,24 +558,6 @@ fn detect_patch_format(output: &str) -> Option<WorkerPatchFormat> {
     }
 }
 
-fn context_truncation_diagnostics(context_truncated: bool) -> Vec<String> {
-    if context_truncated {
-        vec![format!(
-            "Context files were truncated to {CONTEXT_FILES_MAX_BYTES} bytes before delegation."
-        )]
-    } else {
-        Vec::new()
-    }
-}
-
-fn candidate_status_name(status: &MiniMaxDelegationStatus) -> &'static str {
-    match status {
-        MiniMaxDelegationStatus::Completed => "completed",
-        MiniMaxDelegationStatus::Clarify => "clarify",
-        MiniMaxDelegationStatus::Invalid => "invalid",
-    }
-}
-
 async fn collect_stream_text(
     stream: &mut crate::client_common::ResponseStream,
 ) -> CodexResult<String> {
@@ -551,6 +591,7 @@ mod tests {
     use codex_login::ProviderCredentials;
     use codex_login::save_provider_credentials;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
     use serial_test::serial;
     use std::ffi::OsStr;
     use std::ffi::OsString;
@@ -560,7 +601,9 @@ mod tests {
     use wiremock::matchers::path;
 
     use super::CONTEXT_FILES_MAX_BYTES;
+    use super::DEFAULT_CONTEXT_FILE_MAX_BYTES;
     use super::DelegateToMinimaxRequest;
+    use super::MINIMAX_DELEGATE_SYSTEM_PROMPT;
     use super::MiniMaxDelegationResult;
     use super::MiniMaxDelegationStatus;
     use super::WorkerPatchFormat;
@@ -657,7 +700,7 @@ mod tests {
     fn parse_delegate_output_returns_completed_patch_candidate() {
         let result = parse_delegate_output(
             r#"{"status":"completed","format":"apply_patch","summary":"Implement validate_email","patch":"*** Begin Patch\n*** Add File: validate_email.py\n+def validate_email(value: str) -> bool:\n+    return \"@\" in value\n*** End Patch","diagnostics":["worker checked existing helper signature"]}"#,
-            /*context_truncated*/ false,
+            &[],
         );
 
         assert_eq!(
@@ -677,11 +720,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_delegate_output_returns_clarify_response() {
+    fn parse_delegate_output_returns_json_clarify_response() {
         let result = parse_delegate_output(
-            "CLARIFY: should I preserve the helper signature?",
-            /*context_truncated*/ false,
+            r#"{"status":"clarify","question":"should I preserve the helper signature?","diagnostics":["need existing helper file"]}"#,
+            &["omitted .env: denied path".to_string()],
         );
+
+        assert_eq!(
+            result,
+            MiniMaxDelegationResult {
+                status: MiniMaxDelegationStatus::Clarify,
+                format: None,
+                summary: None,
+                patch: None,
+                question: Some("should I preserve the helper signature?".to_string()),
+                error: None,
+                diagnostics: vec![
+                    "omitted .env: denied path".to_string(),
+                    "need existing helper file".to_string(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_delegate_output_keeps_legacy_clarify_compatibility() {
+        let result = parse_delegate_output("CLARIFY: should I preserve the helper signature?", &[]);
 
         assert_eq!(
             result,
@@ -698,10 +762,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_delegate_output_rejects_prose_without_patch() {
+    fn parse_delegate_output_returns_invalid_response() {
         let result = parse_delegate_output(
-            "I updated the helper and added tests.",
-            /*context_truncated*/ false,
+            r#"{"status":"invalid","error":"missing src/lib.rs context","diagnostics":["attach src/lib.rs"]}"#,
+            &["context truncated: exceeded total budget".to_string()],
         );
 
         assert_eq!(
@@ -712,8 +776,29 @@ mod tests {
                 summary: None,
                 patch: None,
                 question: None,
+                error: Some("missing src/lib.rs context".to_string()),
+                diagnostics: vec![
+                    "context truncated: exceeded total budget".to_string(),
+                    "attach src/lib.rs".to_string(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_delegate_output_rejects_prose_without_json() {
+        let result = parse_delegate_output("I updated the helper and added tests.", &[]);
+
+        assert_eq!(
+            result,
+            MiniMaxDelegationResult {
+                status: MiniMaxDelegationStatus::Invalid,
+                format: None,
+                summary: None,
+                patch: None,
+                question: None,
                 error: Some(
-                    "MiniMax returned invalid output: expected JSON patch candidate or `CLARIFY: <question>`."
+                    "MiniMax returned invalid output: expected JSON with status `completed`, `clarify`, or `invalid`."
                         .to_string()
                 ),
                 diagnostics: Vec::new(),
@@ -725,7 +810,9 @@ mod tests {
     #[serial(env_minimax_delegate)]
     async fn delegate_to_minimax_returns_clarify_response() {
         let server = MockServer::start().await;
-        let body = nonstreaming_chat_response_body("CLARIFY: should I add property-based tests?");
+        let body = nonstreaming_chat_response_body(
+            r#"{"status":"clarify","question":"should I add property-based tests?","diagnostics":["need target test file"]}"#,
+        );
         wiremock::Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(
@@ -746,6 +833,7 @@ mod tests {
                 task_description: "Implement validate_email".to_string(),
                 acceptance_criteria: vec!["Add 5 unit tests".to_string()],
                 context_files: Vec::new(),
+                include_modified_files: false,
             },
             temp_dir.path(),
             temp_dir.path(),
@@ -762,7 +850,7 @@ mod tests {
                 patch: None,
                 question: Some("should I add property-based tests?".to_string()),
                 error: None,
-                diagnostics: Vec::new(),
+                diagnostics: vec!["need target test file".to_string()],
             }
         );
     }
@@ -797,6 +885,7 @@ mod tests {
                 task_description: "Implement fizzbuzz".to_string(),
                 acceptance_criteria: vec!["Write 3 unit tests".to_string()],
                 context_files: vec!["big_context.py".to_string()],
+                include_modified_files: false,
             },
             temp_dir.path(),
             temp_dir.path(),
@@ -815,10 +904,9 @@ mod tests {
                 ),
                 question: None,
                 error: None,
-                diagnostics: vec![
-                    "Context files were truncated to 32768 bytes before delegation."
-                        .to_string()
-                ],
+                diagnostics: vec![format!(
+                    "context file big_context.py truncated at {DEFAULT_CONTEXT_FILE_MAX_BYTES} bytes"
+                )],
             }
         );
     }
@@ -872,14 +960,61 @@ mod tests {
         assert_eq!(tool.name, "delegate_to_minimax");
         assert!(!tool.defer_loading);
         assert_eq!(tool.namespace, None);
+        assert_eq!(tool.input_schema["required"], json!(["task_description"]));
+        assert!(tool.input_schema["properties"]["context_files"].is_object());
+        assert_eq!(
+            tool.input_schema["properties"]["include_modified_files"]["type"],
+            json!("boolean")
+        );
+        assert!(
+            tool.input_schema["required"]
+                .as_array()
+                .is_some_and(|required| {
+                    !required
+                        .iter()
+                        .any(|entry| entry == "include_modified_files")
+                })
+        );
     }
 
     #[test]
     fn delegate_to_minimax_prompt_is_only_added_when_tool_is_registered() {
         assert!(delegate_to_minimax_developer_instructions(&[]).is_none());
-        assert!(
+        let prompt =
             delegate_to_minimax_developer_instructions(&[delegate_to_minimax_dynamic_tool()])
-                .is_some()
+                .expect("delegate tool should inject developer instructions");
+        assert!(prompt.contains(r#""status":"clarify""#));
+        assert!(prompt.contains(r#""status":"invalid""#));
+        assert!(prompt.contains("Avoid indefinite retry loops"));
+        assert!(prompt.contains("include_modified_files"));
+        assert!(prompt.contains("secrets, credentials, auth, tokens"));
+    }
+
+    #[test]
+    fn delegate_to_minimax_request_defaults_include_modified_files_to_false() {
+        let request: DelegateToMinimaxRequest = serde_json::from_value(json!({
+            "task_description": "Implement validate_email",
+            "acceptance_criteria": ["Add 5 unit tests"],
+            "context_files": ["src/lib.rs"]
+        }))
+        .expect("deserialize delegate request");
+
+        assert_eq!(
+            request,
+            DelegateToMinimaxRequest {
+                task_description: "Implement validate_email".to_string(),
+                acceptance_criteria: vec!["Add 5 unit tests".to_string()],
+                context_files: vec!["src/lib.rs".to_string()],
+                include_modified_files: false,
+            }
+        );
+    }
+
+    #[test]
+    fn delegate_to_minimax_worker_prompt_mentions_git_modified_context() {
+        assert!(MINIMAX_DELEGATE_SYSTEM_PROMPT.contains("modified in git"));
+        assert!(
+            MINIMAX_DELEGATE_SYSTEM_PROMPT.contains("Do not assume you saw the entire repository")
         );
     }
 }

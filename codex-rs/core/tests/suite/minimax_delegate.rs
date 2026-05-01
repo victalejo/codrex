@@ -35,6 +35,7 @@ use serde_json::json;
 use serial_test::serial;
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::process::Command;
 use wiremock::MockServer;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -74,6 +75,15 @@ fn call_output(req: &ResponsesRequest, call_id: &str) -> (String, Option<bool>) 
         .expect("function_call_output should exist");
     let content = content_opt.expect("function_call_output should contain text");
     (content, success)
+}
+
+fn run_git(repo: &std::path::Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} should succeed");
 }
 
 struct EnvVarGuard {
@@ -117,7 +127,7 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
             "Keep the existing function signature.",
             "Only update src/lib.rs."
         ],
-        "context_files": ["src/lib.rs"]
+        "include_modified_files": true
     })
     .to_string();
     let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn add(a: i32, b: i32) -> i32 {\n-    a - b\n-}\n+pub fn add(a: i32, b: i32) -> i32 {\n+    a + b\n+}\n*** End Patch";
@@ -150,7 +160,7 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
             "format": "apply_patch",
             "summary": "Implement add",
             "patch": patch,
-            "diagnostics": []
+            "diagnostics": ["worker checked existing helper signature"]
         })
         .to_string(),
     );
@@ -186,9 +196,35 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
         },
     )?;
     std::fs::create_dir_all(base_test.workspace_path("src"))?;
+    run_git(&base_test.workspace_path("."), &["init", "-q"]);
+    run_git(
+        &base_test.workspace_path("."),
+        &["config", "user.email", "test@example.com"],
+    );
+    run_git(
+        &base_test.workspace_path("."),
+        &["config", "user.name", "Test User"],
+    );
+    std::fs::write(
+        base_test.workspace_path("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a * b\n}\n",
+    )?;
+    std::fs::write(
+        base_test.workspace_path(".env"),
+        "OPENAI_API_KEY=sk-test-secret\n",
+    )?;
+    run_git(
+        &base_test.workspace_path("."),
+        &["add", "src/lib.rs", ".env"],
+    );
+    run_git(&base_test.workspace_path("."), &["commit", "-qm", "init"]);
     std::fs::write(
         base_test.workspace_path("src/lib.rs"),
         "pub fn add(a: i32, b: i32) -> i32 {\n    a - b\n}\n",
+    )?;
+    std::fs::write(
+        base_test.workspace_path(".env"),
+        "OPENAI_API_KEY=sk-updated-secret\n",
     )?;
     let new_thread = base_test
         .thread_manager
@@ -231,15 +267,40 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
         delegate_request.task_description,
         "Change add to return a + b."
     );
-    assert_eq!(
-        delegate_request.context_files,
-        vec!["src/lib.rs".to_string()]
-    );
+    assert_eq!(delegate_request.context_files, Vec::<String>::new());
+    assert!(delegate_request.include_modified_files);
 
     let delegate_result =
         delegate_to_minimax(delegate_request, test.cwd_path(), test.codex_home_path()).await?;
     assert_eq!(delegate_result.status, MiniMaxDelegationStatus::Completed);
+    assert_eq!(
+        delegate_result.diagnostics,
+        vec![
+            "omitted git modified file .env: denied path".to_string(),
+            "worker checked existing helper signature".to_string(),
+        ]
+    );
     let delegate_result_json = serde_json::to_string(&delegate_result)?;
+
+    let minimax_requests = minimax_server.received_requests().await.unwrap_or_default();
+    assert_eq!(minimax_requests.len(), 1);
+    let minimax_request_body: Value = minimax_requests[0].body_json()?;
+    let minimax_request_text = minimax_request_body.to_string();
+    assert!(minimax_request_text.contains("<context>"));
+    assert!(minimax_request_text.contains("currently modified in git"));
+    assert!(
+        minimax_request_text.contains(r#"<file path=\"src/lib.rs\" truncated=\"false\">"#),
+        "expected packed context file in minimax request: {minimax_request_text}"
+    );
+    assert!(minimax_request_text.contains("pub fn add(a: i32, b: i32) -> i32"));
+    assert!(
+        !minimax_request_text.contains(".env"),
+        "denylisted file should not be sent to MiniMax: {minimax_request_text}"
+    );
+    assert!(
+        !minimax_request_text.contains("OPENAI_API_KEY"),
+        "redacted or denied secrets should not be sent to MiniMax: {minimax_request_text}"
+    );
 
     test.codex
         .submit(Op::DynamicToolResponse {
@@ -275,6 +336,13 @@ async fn supervisor_can_delegate_to_minimax_and_apply_patch_candidate() -> Resul
     assert_eq!(delegate_output_json["status"], "completed");
     assert_eq!(delegate_output_json["summary"], "Implement add");
     assert_eq!(delegate_output_json["patch"], patch);
+    assert_eq!(
+        delegate_output_json["diagnostics"],
+        json!([
+            "omitted git modified file .env: denied path",
+            "worker checked existing helper signature"
+        ])
+    );
 
     let (apply_output, apply_success_flag) = call_output(&requests[2], apply_call_id);
     assert_eq!(apply_success_flag, None);
