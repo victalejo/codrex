@@ -43,6 +43,7 @@ use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line;
 use crate::wrapping::adaptive_wrap_lines;
 use base64::Engine;
+use codex_app_server_protocol::DynamicToolCallOutputContentItem;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::McpServerStatusDetail;
 use codex_config::types::McpServerTransportConfig;
@@ -1726,6 +1727,163 @@ pub(crate) fn new_active_mcp_tool_call(
     animations_enabled: bool,
 ) -> McpToolCallCell {
     McpToolCallCell::new(call_id, invocation, animations_enabled)
+}
+
+const DYNAMIC_TOOL_OUTPUT_MAX_LINES: usize = 10;
+
+#[derive(Debug)]
+pub(crate) struct DynamicToolCallCell {
+    call_id: String,
+    tool: String,
+    summary: String,
+    start_time: Instant,
+    duration: Option<Duration>,
+    success: Option<bool>,
+    content_items: Vec<DynamicToolCallOutputContentItem>,
+    animations_enabled: bool,
+}
+
+impl DynamicToolCallCell {
+    pub(crate) fn new(
+        call_id: String,
+        tool: String,
+        arguments: serde_json::Value,
+        animations_enabled: bool,
+    ) -> Self {
+        Self {
+            call_id,
+            summary: dynamic_tool_summary(&tool, &arguments),
+            tool,
+            start_time: Instant::now(),
+            duration: None,
+            success: None,
+            content_items: Vec::new(),
+            animations_enabled,
+        }
+    }
+
+    pub(crate) fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    pub(crate) fn complete(
+        &mut self,
+        duration: Duration,
+        success: bool,
+        content_items: Vec<DynamicToolCallOutputContentItem>,
+    ) {
+        self.duration = Some(duration);
+        self.success = Some(success);
+        self.content_items = content_items;
+    }
+
+    fn header(&self) -> String {
+        match (self.success, self.is_clarify_response(), self.duration) {
+            (None, _, _) if self.tool == "delegate_to_minimax" => {
+                "Delegating to MiniMax...".to_string()
+            }
+            (None, _, _) => format!("Calling {}", self.tool),
+            (Some(true), _, Some(duration)) if self.tool == "delegate_to_minimax" => format!(
+                "MiniMax completed in {}",
+                format_duration_ms(duration.as_millis() as u64)
+            ),
+            (Some(false), true, Some(duration)) => format!(
+                "MiniMax requested clarification in {}",
+                format_duration_ms(duration.as_millis() as u64)
+            ),
+            (Some(false), _, Some(duration)) if self.tool == "delegate_to_minimax" => format!(
+                "MiniMax failed in {}",
+                format_duration_ms(duration.as_millis() as u64)
+            ),
+            (Some(true), _, _) => format!("{} completed", self.tool),
+            (Some(false), _, _) => format!("{} failed", self.tool),
+        }
+    }
+
+    fn is_clarify_response(&self) -> bool {
+        dynamic_tool_result_text(&self.content_items)
+            .trim_start()
+            .starts_with("CLARIFY:")
+    }
+}
+
+impl HistoryCell for DynamicToolCallCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let bullet = match self.success {
+            Some(true) => "•".green().bold(),
+            Some(false) => "•".red().bold(),
+            None => spinner(Some(self.start_time), self.animations_enabled),
+        };
+
+        let mut lines = vec![Line::from(vec![bullet, " ".into(), self.header().bold()])];
+        let mut detail_lines: Vec<Line<'static>> = Vec::new();
+        detail_lines.push(Line::from(vec![
+            "task".dim(),
+            ": ".dim(),
+            self.summary.clone().into(),
+        ]));
+
+        let output_text = dynamic_tool_result_text(&self.content_items);
+        if !output_text.trim().is_empty() {
+            detail_lines.push(Line::from("worker output:".dim()));
+            let detail_wrap_width = (width as usize).saturating_sub(4).max(1);
+            let preview = format_and_truncate_tool_result(
+                &output_text,
+                DYNAMIC_TOOL_OUTPUT_MAX_LINES,
+                detail_wrap_width,
+            );
+            for preview_line in preview.lines() {
+                let preview_line = Line::from(preview_line.to_string());
+                let wrapped = adaptive_wrap_line(
+                    &preview_line,
+                    RtOptions::new(detail_wrap_width)
+                        .initial_indent("".into())
+                        .subsequent_indent("    ".into()),
+                );
+                detail_lines.extend(wrapped.iter().map(line_to_static));
+            }
+        }
+
+        lines.extend(prefix_lines(detail_lines, "  └ ".dim(), "    ".into()));
+        lines
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if !self.animations_enabled || self.success.is_some() {
+            return None;
+        }
+        Some((self.start_time.elapsed().as_millis() / 50) as u64)
+    }
+}
+
+pub(crate) fn new_active_dynamic_tool_call(
+    call_id: String,
+    tool: String,
+    arguments: serde_json::Value,
+    animations_enabled: bool,
+) -> DynamicToolCallCell {
+    DynamicToolCallCell::new(call_id, tool, arguments, animations_enabled)
+}
+
+fn dynamic_tool_summary(tool: &str, arguments: &serde_json::Value) -> String {
+    arguments
+        .get("task_description")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| serde_json::to_string(arguments).unwrap_or_else(|_| tool.to_string()))
+}
+
+fn dynamic_tool_result_text(items: &[DynamicToolCallOutputContentItem]) -> String {
+    items
+        .iter()
+        .map(|item| match item {
+            DynamicToolCallOutputContentItem::InputText { text } => text.clone(),
+            DynamicToolCallOutputContentItem::InputImage { image_url } => {
+                format!("<image> {image_url}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn web_search_header(completed: bool) -> &'static str {
@@ -4627,6 +4785,75 @@ mod tests {
 
         assert!(rendered.contains("[Image #1]"));
         assert!(rendered.contains("describe inline image"));
+    }
+
+    #[test]
+    fn dynamic_tool_call_running_snapshot() {
+        let cell = new_active_dynamic_tool_call(
+            "dyn-1".to_string(),
+            "delegate_to_minimax".to_string(),
+            json!({
+                "task_description": "implement validate_email and add 5 unit tests in tests/test_email.py"
+            }),
+            /*animations_enabled*/ false,
+        );
+
+        let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn dynamic_tool_call_completed_snapshot() {
+        let mut cell = new_active_dynamic_tool_call(
+            "dyn-1".to_string(),
+            "delegate_to_minimax".to_string(),
+            json!({
+                "task_description": "implement validate_email and add 5 unit tests in tests/test_email.py"
+            }),
+            /*animations_enabled*/ false,
+        );
+        cell.complete(
+            Duration::from_secs(12),
+            /*success*/ true,
+            vec![
+                DynamicToolCallOutputContentItem::InputText {
+                    text: "Note: context files were truncated to 32768 bytes before delegation."
+                        .to_string(),
+                },
+                DynamicToolCallOutputContentItem::InputText {
+                    text: "def validate_email(value: str) -> bool:\n    return \"@\" in value"
+                        .to_string(),
+                },
+            ],
+        );
+
+        let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn dynamic_tool_call_clarify_snapshot() {
+        let mut cell = new_active_dynamic_tool_call(
+            "dyn-1".to_string(),
+            "delegate_to_minimax".to_string(),
+            json!({
+                "task_description": "implement validate_email and add 5 unit tests in tests/test_email.py"
+            }),
+            /*animations_enabled*/ false,
+        );
+        cell.complete(
+            Duration::from_secs(7),
+            /*success*/ false,
+            vec![DynamicToolCallOutputContentItem::InputText {
+                text: "CLARIFY: should I preserve the existing helper signature?".to_string(),
+            }],
+        );
+
+        let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+        insta::assert_snapshot!(rendered);
     }
 
     #[test]

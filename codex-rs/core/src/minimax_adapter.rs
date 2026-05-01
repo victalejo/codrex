@@ -529,7 +529,7 @@ pub async fn stream_chat_completions(
         ResponseEventBridge::with_telemetry(bridge_run_id, bridge_model, started_at),
     ));
 
-    let bridge_handle = bridge.clone();
+    let bridge_handle = bridge;
     let log_run_id = run_id.clone();
     let log_model = model_for_log.clone();
     tokio::spawn(async move {
@@ -975,11 +975,13 @@ data: [DONE]\n\n";
         while let Some(item) = stream.next().await {
             match item.expect("event ok") {
                 ResponseEvent::OutputTextDelta(delta) => text.push_str(&delta),
-                ResponseEvent::Completed { token_usage, .. } => {
-                    if let Some(usage) = token_usage {
-                        completed = Some(usage.total_tokens);
-                    }
-                }
+                ResponseEvent::Completed {
+                    token_usage: Some(usage),
+                    ..
+                } => completed = Some(usage.total_tokens),
+                ResponseEvent::Completed {
+                    token_usage: None, ..
+                } => {}
                 _ => {}
             }
         }

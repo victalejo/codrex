@@ -2559,6 +2559,13 @@ impl Session {
         {
             developer_sections.push(collab_instructions.render());
         }
+        if let Some(delegate_instructions) =
+            crate::minimax_delegate::delegate_to_minimax_developer_instructions(
+                &turn_context.dynamic_tools,
+            )
+        {
+            developer_sections.push(delegate_instructions);
+        }
         if let Some(realtime_update) = crate::context_manager::updates::build_initial_realtime_item(
             reference_context_item.as_ref(),
             previous_turn_settings.as_ref(),

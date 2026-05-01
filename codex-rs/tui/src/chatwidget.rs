@@ -357,6 +357,7 @@ use crate::get_git_diff::get_git_diff;
 use crate::history_cell;
 #[cfg(test)]
 use crate::history_cell::AgentMessageCell;
+use crate::history_cell::DynamicToolCallCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::HookCell;
 use crate::history_cell::McpToolCallCell;
@@ -4478,6 +4479,86 @@ impl ChatWidget {
         self.defer_or_handle(|q| q.push_mcp_end(ev), |s| s.handle_mcp_end_now(ev2));
     }
 
+    fn on_dynamic_tool_call_begin(
+        &mut self,
+        call_id: String,
+        tool: String,
+        arguments: serde_json::Value,
+    ) {
+        self.bottom_pane.ensure_status_indicator();
+        if tool == "delegate_to_minimax" {
+            self.set_status_header("Delegating to MiniMax...".to_string());
+        }
+        self.flush_answer_stream_with_separator();
+        self.flush_active_cell();
+        self.active_cell = Some(Box::new(history_cell::new_active_dynamic_tool_call(
+            call_id,
+            tool,
+            arguments,
+            self.config.animations,
+        )));
+        self.bump_active_cell_revision();
+        self.request_redraw();
+    }
+
+    fn on_dynamic_tool_call_end(
+        &mut self,
+        call_id: String,
+        tool: String,
+        arguments: serde_json::Value,
+        success: bool,
+        content_items: Vec<codex_app_server_protocol::DynamicToolCallOutputContentItem>,
+        duration: Duration,
+    ) {
+        let clarification_requested = content_items.iter().any(|item| {
+            matches!(
+                item,
+                codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text }
+                    if text.trim_start().starts_with("CLARIFY:")
+            )
+        });
+        self.flush_answer_stream_with_separator();
+        let mut handled = false;
+        if let Some(cell) = self
+            .active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<DynamicToolCallCell>())
+            && cell.call_id() == call_id
+        {
+            cell.complete(duration, success, content_items.clone());
+            self.bump_active_cell_revision();
+            self.flush_active_cell();
+            handled = true;
+        }
+
+        if !handled {
+            let mut cell = history_cell::new_active_dynamic_tool_call(
+                call_id, tool, arguments, /*animations_enabled*/ false,
+            );
+            cell.complete(duration, success, content_items);
+            self.add_to_history(cell);
+        }
+
+        self.bottom_pane.ensure_status_indicator();
+        if success {
+            self.set_status_header(format!(
+                "MiniMax completed in {}",
+                crate::status_indicator_widget::fmt_elapsed_compact(duration.as_secs())
+            ));
+        } else if clarification_requested {
+            self.set_status_header(format!(
+                "MiniMax requested clarification after {}",
+                crate::status_indicator_widget::fmt_elapsed_compact(duration.as_secs())
+            ));
+        } else {
+            self.set_status_header(format!(
+                "MiniMax needs attention after {}",
+                crate::status_indicator_widget::fmt_elapsed_compact(duration.as_secs())
+            ));
+        }
+        self.had_work_activity = true;
+    }
+
     fn on_web_search_begin(&mut self, ev: WebSearchBeginEvent) {
         self.flush_answer_stream_with_separator();
         self.flush_active_cell();
@@ -6833,6 +6914,27 @@ impl ChatWidget {
                     },
                 });
             }
+            ThreadItem::DynamicToolCall {
+                id,
+                tool,
+                arguments,
+                content_items,
+                success,
+                duration_ms,
+                ..
+            } => {
+                if from_replay {
+                    self.on_dynamic_tool_call_begin(id.clone(), tool.clone(), arguments.clone());
+                }
+                self.on_dynamic_tool_call_end(
+                    id,
+                    tool,
+                    arguments,
+                    success.unwrap_or(false),
+                    content_items.unwrap_or_default(),
+                    Duration::from_millis(duration_ms.unwrap_or_default().max(0) as u64),
+                );
+            }
             ThreadItem::WebSearch { id, query, action } => {
                 self.on_web_search_begin(WebSearchBeginEvent {
                     call_id: id.clone(),
@@ -6896,7 +6998,6 @@ impl ChatWidget {
                 reasoning_effort,
                 agents_states,
             }),
-            ThreadItem::DynamicToolCall { .. } => {}
         }
 
         if matches!(replay_kind, Some(ReplayKind::ThreadSnapshot)) && turn_id.is_empty() {
@@ -7359,6 +7460,14 @@ impl ChatWidget {
                     },
                     mcp_app_resource_uri,
                 });
+            }
+            ThreadItem::DynamicToolCall {
+                id,
+                tool,
+                arguments,
+                ..
+            } => {
+                self.on_dynamic_tool_call_begin(id, tool, arguments);
             }
             ThreadItem::WebSearch { id, .. } => {
                 self.on_web_search_begin(WebSearchBeginEvent { call_id: id });

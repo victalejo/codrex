@@ -240,6 +240,16 @@ impl App {
         app_server_client: &AppServerSession,
         request: ServerRequest,
     ) {
+        if let ServerRequest::DynamicToolCall { request_id, params } = request {
+            if let Err(err) = self
+                .handle_dynamic_tool_call_request(app_server_client, request_id, params)
+                .await
+            {
+                tracing::warn!("failed to handle dynamic tool call request: {err}");
+            }
+            return;
+        }
+
         if let Some(unsupported) = self
             .pending_app_server_requests
             .note_server_request(&request)
@@ -279,6 +289,85 @@ impl App {
             tracing::warn!("failed to enqueue app-server request: {err}");
         }
     }
+
+    async fn handle_dynamic_tool_call_request(
+        &mut self,
+        app_server_client: &AppServerSession,
+        request_id: codex_app_server_protocol::RequestId,
+        params: codex_app_server_protocol::DynamicToolCallParams,
+    ) -> std::result::Result<(), String> {
+        if params.tool != crate::legacy_core::DELEGATE_TO_MINIMAX_TOOL_NAME {
+            let reason = format!("Unsupported dynamic tool `{}`.", params.tool);
+            self.chat_widget.add_error_message(reason.clone());
+            return self
+                .reject_app_server_request(app_server_client, request_id, reason)
+                .await;
+        }
+
+        let thread_id = match ThreadId::from_string(&params.thread_id) {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                return self
+                    .reject_app_server_request(
+                        app_server_client,
+                        request_id,
+                        format!("invalid thread id for dynamic tool call: {err}"),
+                    )
+                    .await;
+            }
+        };
+        let cwd = if self.primary_thread_id == Some(thread_id) {
+            self.primary_session_configured
+                .as_ref()
+                .map(|session| session.cwd.clone())
+                .or_else(|| {
+                    self.chat_widget
+                        .thread_id()
+                        .filter(|id| *id == thread_id)
+                        .map(|_| self.chat_widget.config_ref().cwd.clone())
+                })
+        } else {
+            self.thread_cwd(thread_id).await
+        };
+
+        let request = serde_json::from_value::<crate::legacy_core::DelegateToMinimaxRequest>(
+            params.arguments,
+        )
+        .map_err(|err| format!("delegate_to_minimax received invalid arguments: {err}"));
+        let request_handle = app_server_client.request_handle();
+        let thread_id_text = params.thread_id;
+        tokio::spawn(async move {
+            let response = match (cwd, request) {
+                (Some(cwd), Ok(request)) => {
+                    match crate::legacy_core::delegate_to_minimax(request, cwd.as_path()).await {
+                        Ok(response) => delegate_dynamic_tool_response(response),
+                        Err(err) => dynamic_tool_failure_response(format!(
+                            "MiniMax delegation failed: {err}"
+                        )),
+                    }
+                }
+                (Some(_), Err(err)) => dynamic_tool_failure_response(err),
+                (None, _) => dynamic_tool_failure_response(format!(
+                    "delegate_to_minimax could not resolve a working directory for thread {thread_id_text}"
+                )),
+            };
+
+            match serde_json::to_value(response) {
+                Ok(result) => {
+                    if let Err(err) = request_handle
+                        .resolve_server_request(request_id, result)
+                        .await
+                    {
+                        tracing::warn!("failed to resolve dynamic tool request: {err}");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("failed to serialize dynamic tool response: {err}");
+                }
+            }
+        });
+        Ok(())
+    }
     async fn reject_app_server_request(
         &self,
         app_server_client: &AppServerSession,
@@ -297,6 +386,64 @@ impl App {
             .await
             .map_err(|err| format!("failed to reject app-server request: {err}"))
     }
+}
+
+fn delegate_dynamic_tool_response(
+    response: crate::legacy_core::DelegateToMinimaxResponse,
+) -> codex_app_server_protocol::DynamicToolCallResponse {
+    match response {
+        crate::legacy_core::DelegateToMinimaxResponse::Completed {
+            output,
+            context_truncated,
+        } => codex_app_server_protocol::DynamicToolCallResponse {
+            content_items: dynamic_tool_content_items(output, context_truncated),
+            success: true,
+        },
+        crate::legacy_core::DelegateToMinimaxResponse::Clarify {
+            question,
+            context_truncated,
+        } => codex_app_server_protocol::DynamicToolCallResponse {
+            content_items: dynamic_tool_content_items(
+                format!("CLARIFY: {question}"),
+                context_truncated,
+            ),
+            success: false,
+        },
+    }
+}
+
+fn dynamic_tool_failure_response(
+    message: String,
+) -> codex_app_server_protocol::DynamicToolCallResponse {
+    codex_app_server_protocol::DynamicToolCallResponse {
+        content_items: vec![
+            codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
+                text: message,
+            },
+        ],
+        success: false,
+    }
+}
+
+fn dynamic_tool_content_items(
+    output: String,
+    context_truncated: bool,
+) -> Vec<codex_app_server_protocol::DynamicToolCallOutputContentItem> {
+    let mut items = Vec::with_capacity(2);
+    if context_truncated {
+        items.push(
+            codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
+                text: format!(
+                    "Note: context files were truncated to {} bytes before delegation.",
+                    crate::legacy_core::CONTEXT_FILES_MAX_BYTES
+                ),
+            },
+        );
+    }
+    items.push(
+        codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text: output },
+    );
+    items
 }
 
 fn server_request_thread_id(request: &ServerRequest) -> Option<ThreadId> {
@@ -1709,5 +1856,49 @@ mod tests {
         let target = server_notification_thread_target(&notification);
 
         assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+    }
+
+    #[test]
+    fn delegate_dynamic_tool_response_marks_clarify_as_failure() {
+        let response = super::delegate_dynamic_tool_response(
+            crate::legacy_core::DelegateToMinimaxResponse::Clarify {
+                question: "should I keep the old signature?".to_string(),
+                context_truncated: false,
+            },
+        );
+
+        assert_eq!(response.success, false);
+        assert_eq!(
+            response.content_items,
+            vec![
+                codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
+                    text: "CLARIFY: should I keep the old signature?".to_string(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn delegate_dynamic_tool_response_includes_truncation_warning() {
+        let response = super::delegate_dynamic_tool_response(
+            crate::legacy_core::DelegateToMinimaxResponse::Completed {
+                output: "def fizzbuzz(n):\n    return []".to_string(),
+                context_truncated: true,
+            },
+        );
+
+        assert_eq!(response.success, true);
+        assert_eq!(
+            response.content_items,
+            vec![
+                codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
+                    text: "Note: context files were truncated to 32768 bytes before delegation."
+                        .to_string(),
+                },
+                codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
+                    text: "def fizzbuzz(n):\n    return []".to_string(),
+                },
+            ]
+        );
     }
 }

@@ -1,0 +1,10 @@
+---
+source: tui/src/history_cell.rs
+expression: rendered
+---
+• MiniMax completed in 12.0s
+  └ task: implement validate_email and add 5 unit tests in tests/test_email.py
+    worker output:
+    Note: context files were truncated to 32768 bytes before delegation.
+    def validate_email(value: str) -> bool:
+        return "@" in value

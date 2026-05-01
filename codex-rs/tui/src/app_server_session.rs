@@ -1140,6 +1140,22 @@ fn thread_start_params_from_config(
     remote_cwd_override: Option<&std::path::Path>,
     session_start_source: Option<ThreadStartSource>,
 ) -> ThreadStartParams {
+    let dynamic_tools = matches!(thread_params_mode, ThreadParamsMode::Embedded)
+        .then(|| {
+            crate::legacy_core::is_delegate_to_minimax_available(config.codex_home.as_path()).then(
+                || {
+                    let tool = crate::legacy_core::delegate_to_minimax_dynamic_tool();
+                    vec![codex_app_server_protocol::DynamicToolSpec {
+                        namespace: tool.namespace,
+                        name: tool.name,
+                        description: tool.description,
+                        input_schema: tool.input_schema,
+                        defer_loading: tool.defer_loading,
+                    }]
+                },
+            )
+        })
+        .flatten();
     let permission_profile = permission_profile_override_from_config(config, thread_params_mode);
     let sandbox = permission_profile
         .is_none()
@@ -1160,6 +1176,7 @@ fn thread_start_params_from_config(
         sandbox,
         permission_profile,
         config: config_request_overrides_from_config(config),
+        dynamic_tools,
         ephemeral: Some(config.ephemeral),
         session_start_source,
         persist_extended_history: true,
@@ -1486,6 +1503,9 @@ mod tests {
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
+    use codex_config::types::AuthCredentialsStoreMode;
+    use codex_login::ProviderCredentials;
+    use codex_login::save_provider_credentials;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
@@ -1497,6 +1517,20 @@ mod tests {
             .build()
             .await
             .expect("config should build")
+    }
+
+    fn save_minimax_credentials(temp_dir: &TempDir) {
+        save_provider_credentials(
+            temp_dir.path(),
+            AuthCredentialsStoreMode::File,
+            "minimax",
+            ProviderCredentials {
+                api_key: "minimax-file-token".to_string(),
+                kind: Some("coding_plan".to_string()),
+                last_verified: None,
+            },
+        )
+        .expect("save minimax credentials");
     }
 
     #[tokio::test]
@@ -1536,8 +1570,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_start_params_include_delegate_tool_when_minimax_credentials_exist() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        save_minimax_credentials(&temp_dir);
+        let config = build_config(&temp_dir).await;
+
+        let params = thread_start_params_from_config(
+            &config,
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+            /*session_start_source*/ None,
+        );
+
+        let dynamic_tools = params
+            .dynamic_tools
+            .expect("dynamic tools should be present");
+        assert_eq!(dynamic_tools.len(), 1);
+        assert_eq!(dynamic_tools[0].name, "delegate_to_minimax");
+    }
+
+    #[tokio::test]
     async fn thread_lifecycle_params_omit_cwd_without_remote_override_for_remote_sessions() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
+        save_minimax_credentials(&temp_dir);
         let config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
         let expected_sandbox = sandbox_mode_from_policy(
@@ -1566,6 +1621,7 @@ mod tests {
         );
 
         assert_eq!(start.cwd, None);
+        assert_eq!(start.dynamic_tools, None);
         assert_eq!(resume.cwd, None);
         assert_eq!(fork.cwd, None);
         assert_eq!(start.model_provider, None);
