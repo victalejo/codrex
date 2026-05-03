@@ -6,6 +6,7 @@ use crate::sensitive_output::sensitive_command_block_from_text;
 use crate::shell::Shell;
 use crate::shell::get_shell_by_model_provided_path;
 use crate::strict_delegation::StrictCommandDecision;
+use crate::strict_delegation::StrictDelegationManualAction;
 use crate::strict_delegation::check_shell_command_allowed_in_strict_delegation;
 use crate::strict_delegation::check_shell_text_allowed_in_strict_delegation;
 use crate::strict_delegation::strict_delegation_enabled;
@@ -247,6 +248,12 @@ impl ToolHandler for UnifiedExecHandler {
                                 command_kind,
                                 "strict delegation blocked unified exec command"
                             );
+                            session
+                                .record_strict_delegation_trace_for_turn(
+                                    turn.as_ref(),
+                                    StrictDelegationManualAction::ShellWrite,
+                                )
+                                .await;
                             manager.release_process_id(process_id).await;
                             return Err(FunctionCallError::RespondToModel(reason));
                         }
@@ -422,6 +429,12 @@ impl ToolHandler for UnifiedExecHandler {
                                 command_kind,
                                 "strict delegation blocked unified exec stdin"
                             );
+                            session
+                                .record_strict_delegation_trace_for_turn(
+                                    turn.as_ref(),
+                                    StrictDelegationManualAction::ShellWrite,
+                                )
+                                .await;
                             return Err(FunctionCallError::RespondToModel(reason));
                         }
                     }

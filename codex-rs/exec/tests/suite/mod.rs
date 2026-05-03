@@ -12,3 +12,4 @@ mod resume;
 mod sandbox;
 mod server_error_exit;
 mod strict_delegation;
+mod strict_delegation_e2e;

@@ -14,6 +14,7 @@ use crate::sensitive_output::sensitive_command_block;
 use crate::session::turn_context::TurnContext;
 use crate::shell::Shell;
 use crate::strict_delegation::StrictCommandDecision;
+use crate::strict_delegation::StrictDelegationManualAction;
 use crate::strict_delegation::check_shell_command_allowed_in_strict_delegation;
 use crate::strict_delegation::strict_delegation_enabled;
 use crate::tools::context::FunctionToolOutput;
@@ -435,6 +436,12 @@ impl ShellHandler {
                         command_kind,
                         "strict delegation blocked shell command"
                     );
+                    session
+                        .record_strict_delegation_trace_for_turn(
+                            turn.as_ref(),
+                            StrictDelegationManualAction::ShellWrite,
+                        )
+                        .await;
                     return Err(FunctionCallError::RespondToModel(reason));
                 }
             }

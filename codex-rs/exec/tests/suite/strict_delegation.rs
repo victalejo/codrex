@@ -20,6 +20,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::LazyLock;
 use tokio::sync::Mutex;
+use walkdir::WalkDir;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -35,7 +36,7 @@ const APPLY_CALL_ID: &str = "apply-call";
 const SHELL_WRITE_CALL_ID: &str = "shell-write-call";
 const FIX_ADD_PATCH: &str = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn add(a: i32, b: i32) -> i32 { a - b }\n+pub fn add(a: i32, b: i32) -> i32 { a + b }\n*** End Patch\n";
 const ALT_ADD_PATCH: &str = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn add(a: i32, b: i32) -> i32 { a - b }\n+pub fn add(a: i32, b: i32) -> i32 { a * b }\n*** End Patch\n";
-const STRICT_BLOCK_MESSAGE: &str = "blocked: strict delegation mode requires applying a completed patch candidate returned by delegate_to_minimax. No matching candidate is available.";
+const STRICT_BLOCK_MESSAGE: &str = "strict_delegation_violation: apply_patch is only allowed for validated delegate candidates returned by delegate_to_minimax.";
 const STRICT_SHELL_BLOCK_MESSAGE: &str = "blocked: strict delegation mode forbids manual file modifications via shell. Apply a completed patch candidate returned by delegate_to_minimax instead.";
 const SHELL_REWRITE_LIB_RS_COMMAND: &str =
     "cat <<'EOF' > src/lib.rs\npub fn add(a: i32, b: i32) -> i32 { a + b }\nEOF\n";
@@ -204,6 +205,72 @@ fn assert_file_unchanged(test: &core_test_support::test_codex_exec::TestCodexExe
     );
 }
 
+fn read_rollout_strings(home_path: &Path) -> anyhow::Result<Vec<String>> {
+    let sessions_dir = home_path.join("sessions");
+    let mut values = Vec::new();
+    for entry in WalkDir::new(&sessions_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() || !entry.file_name().to_string_lossy().ends_with(".jsonl")
+        {
+            continue;
+        }
+
+        for line in fs::read_to_string(entry.path())
+            .with_context(|| format!("read rollout {}", entry.path().display()))?
+            .lines()
+        {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            collect_json_strings(&serde_json::from_str::<Value>(trimmed)?, &mut values);
+        }
+    }
+    Ok(values)
+}
+
+fn collect_json_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => out.push(text.clone()),
+        Value::Array(items) => items
+            .iter()
+            .for_each(|item| collect_json_strings(item, out)),
+        Value::Object(map) => map
+            .values()
+            .for_each(|item| collect_json_strings(item, out)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn assert_rollout_contains_trace(
+    home_path: &Path,
+    delegate_called: bool,
+    skip_reason: &str,
+) -> anyhow::Result<()> {
+    let strings = read_rollout_strings(home_path)?;
+    let trace = strings
+        .iter()
+        .find(|text| text.contains("strict_delegation_trace:"))
+        .cloned()
+        .expect("strict delegation trace should be persisted");
+    assert!(
+        trace.contains("\"type\":\"strict_delegation_trace\""),
+        "missing trace type in trace: {trace}"
+    );
+    assert!(
+        trace.contains(&format!("\"delegate_called\":{delegate_called}")),
+        "missing delegate_called={delegate_called} in trace: {trace}"
+    );
+    assert!(
+        trace.contains(&format!("\"delegate_skip_reason\":\"{skip_reason}\"")),
+        "missing skip reason `{skip_reason}` in trace: {trace}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strict_delegation_off_allows_manual_apply_patch() -> anyhow::Result<()> {
     let _lock = lock_minimax_env().await;
@@ -369,6 +436,58 @@ async fn strict_delegation_blocks_apply_patch_without_delegate_call() -> anyhow:
     assert_ne!(apply_success, Some(true));
     assert_eq!(apply_output.as_deref(), Some(STRICT_BLOCK_MESSAGE));
     assert_file_unchanged(&test);
+    assert_rollout_contains_trace(
+        test.home_path(),
+        /*delegate_called*/ false,
+        "supervisor_selected_manual_patch",
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_delegation_persists_final_trace_when_supervisor_self_restricts_before_tool_call()
+-> anyhow::Result<()> {
+    let _lock = lock_minimax_env().await;
+    let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
+    let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
+
+    let test = test_codex_exec();
+    init_add_repo(test.cwd_path())?;
+
+    let supervisor_server = responses::start_mock_server().await;
+    responses::mount_sse_once(
+        &supervisor_server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_assistant_message(
+                "msg-1",
+                "I cannot apply a manual patch under strict delegation without calling delegate_to_minimax first.",
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let output = run_exec(
+        &test,
+        &supervisor_server,
+        /*strict_delegation*/ true,
+        "refuse before any tool call",
+    )?;
+    assert!(
+        output.status.success(),
+        "codex-exec failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_file_unchanged(&test);
+    assert_rollout_contains_trace(
+        test.home_path(),
+        /*delegate_called*/ false,
+        "supervisor_self_restricted_before_tool_call",
+    )?;
 
     Ok(())
 }

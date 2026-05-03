@@ -31,6 +31,7 @@ use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
+use crate::strict_delegation::strict_delegation_enabled;
 use codex_analytics::TurnTokenUsageFact;
 use codex_login::AuthManager;
 use codex_models_manager::manager::SharedModelsManager;
@@ -689,6 +690,20 @@ impl Session {
             .await
         {
             warn!("failed to apply goal runtime turn-finished event: {err}");
+        }
+        if should_clear_active_turn
+            && strict_delegation_enabled(turn_context.developer_instructions.as_deref())
+            && let Some(turn_state) = turn_state.as_ref()
+        {
+            let trace = {
+                let ts = turn_state.lock().await;
+                ts.strict_delegation_state()
+                    .trace_for_completed_turn(turn_tool_calls)
+            };
+            if let Some(trace) = trace {
+                self.record_strict_delegation_trace(turn_context.as_ref(), trace)
+                    .await;
+            }
         }
         let event = EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: turn_context.sub_id.clone(),

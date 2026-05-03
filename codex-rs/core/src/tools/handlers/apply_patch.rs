@@ -13,7 +13,7 @@ use crate::function_tool::FunctionCallError;
 use crate::sensitive_output::is_sensitive_path;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::strict_delegation::STRICT_DELEGATION_BLOCK_MESSAGE;
+use crate::strict_delegation::STRICT_DELEGATION_APPLY_PATCH_BLOCK_MESSAGE;
 use crate::tools::context::ApplyPatchToolOutput;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -335,10 +335,15 @@ async fn enforce_strict_delegation_patch(
             ?violation.reason,
             has_completed_candidate = violation.has_completed_candidate,
             candidate_count = violation.candidate_count,
+            delegate_called = violation.delegate_trace.delegate_called,
+            delegate_skip_reason = violation.delegate_trace.delegate_skip_reason.as_str(),
             "strict delegation blocked patch application"
         );
+        session
+            .record_strict_delegation_trace(turn, violation.delegate_trace)
+            .await;
         return Err(FunctionCallError::RespondToModel(
-            STRICT_DELEGATION_BLOCK_MESSAGE.to_string(),
+            STRICT_DELEGATION_APPLY_PATCH_BLOCK_MESSAGE.to_string(),
         ));
     }
 

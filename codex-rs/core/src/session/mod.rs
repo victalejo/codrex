@@ -289,6 +289,8 @@ use crate::state::SessionState;
 use crate::stream_events_utils::HandleOutputCtx;
 #[cfg(test)]
 use crate::stream_events_utils::handle_output_item_done;
+use crate::strict_delegation::StrictDelegationManualAction;
+use crate::strict_delegation::StrictDelegationTrace;
 use crate::strict_delegation::StrictDelegationViolation;
 use crate::strict_delegation::strict_delegation_enabled;
 use crate::tasks::GhostSnapshotTask;
@@ -2320,12 +2322,67 @@ impl Session {
                     crate::strict_delegation::StrictDelegationViolationReason::NoCompletedCandidate,
                 has_completed_candidate: false,
                 candidate_count: 0,
+                delegate_trace: StrictDelegationTrace::default_for_action(
+                    StrictDelegationManualAction::ApplyPatch,
+                ),
             });
         };
         let ts = turn_state.lock().await;
         ts.strict_delegation_state()
             .validate_apply_patch(patch)
             .err()
+    }
+
+    pub(crate) async fn strict_delegation_trace_for_turn(
+        &self,
+        turn_context: &TurnContext,
+        action: StrictDelegationManualAction,
+    ) -> Option<StrictDelegationTrace> {
+        if !strict_delegation_enabled(turn_context.developer_instructions.as_deref()) {
+            return None;
+        }
+
+        let turn_state = {
+            let active = self.active_turn.lock().await;
+            active.as_ref().map(|active| Arc::clone(&active.turn_state))
+        };
+        let Some(turn_state) = turn_state else {
+            return Some(StrictDelegationTrace::default_for_action(action));
+        };
+
+        let ts = turn_state.lock().await;
+        Some(ts.strict_delegation_state().trace_for_manual_action(action))
+    }
+
+    pub(crate) async fn record_strict_delegation_trace(
+        &self,
+        turn_context: &TurnContext,
+        trace: StrictDelegationTrace,
+    ) {
+        let payload = serde_json::json!({
+            "type": "strict_delegation_trace",
+            "strict_delegation": true,
+            "delegate_required": true,
+            "delegate_called": trace.delegate_called,
+            "delegate_skip_reason": trace.delegate_skip_reason.as_str(),
+        })
+        .to_string();
+        self.record_model_warning(format!("strict_delegation_trace: {payload}"), turn_context)
+            .await;
+    }
+
+    pub(crate) async fn record_strict_delegation_trace_for_turn(
+        &self,
+        turn_context: &TurnContext,
+        action: StrictDelegationManualAction,
+    ) {
+        if let Some(trace) = self
+            .strict_delegation_trace_for_turn(turn_context, action)
+            .await
+        {
+            self.record_strict_delegation_trace(turn_context, trace)
+                .await;
+        }
     }
 
     pub(crate) async fn granted_session_permissions(&self) -> Option<AdditionalPermissionProfile> {

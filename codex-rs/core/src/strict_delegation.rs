@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 pub(crate) const STRICT_DELEGATION_MARKER: &str = "<strict_delegation mode=\"required\" />";
-pub(crate) const STRICT_DELEGATION_BLOCK_MESSAGE: &str = "blocked: strict delegation mode requires applying a completed patch candidate returned by delegate_to_minimax. No matching candidate is available.";
+pub(crate) const STRICT_DELEGATION_APPLY_PATCH_BLOCK_MESSAGE: &str = "strict_delegation_violation: apply_patch is only allowed for validated delegate candidates returned by delegate_to_minimax.";
 pub(crate) const STRICT_DELEGATION_SHELL_BLOCK_MESSAGE: &str = "blocked: strict delegation mode forbids manual file modifications via shell. Apply a completed patch candidate returned by delegate_to_minimax instead.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,11 +43,74 @@ pub(crate) enum StrictDelegationViolationReason {
     PatchMismatch,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictDelegationManualAction {
+    ApplyPatch,
+    ShellWrite,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(
+    dead_code,
+    reason = "reserved strict delegation skip reasons for startup and routing diagnostics"
+)]
+pub(crate) enum StrictDelegationSkipReason {
+    SupervisorSelectedManualPatch,
+    SupervisorSelfRestrictedBeforeToolCall,
+    StartupPluginSyncFailed,
+    AuthRefreshFailed,
+    ToolUnavailable,
+    SkillsRoutingIntercepted,
+    CandidateMissing,
+    CandidateInvalid,
+}
+
+impl StrictDelegationSkipReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::SupervisorSelectedManualPatch => "supervisor_selected_manual_patch",
+            Self::SupervisorSelfRestrictedBeforeToolCall => {
+                "supervisor_self_restricted_before_tool_call"
+            }
+            Self::StartupPluginSyncFailed => "startup_plugin_sync_failed",
+            Self::AuthRefreshFailed => "auth_refresh_failed",
+            Self::ToolUnavailable => "tool_unavailable",
+            Self::SkillsRoutingIntercepted => "skills_routing_intercepted",
+            Self::CandidateMissing => "candidate_missing",
+            Self::CandidateInvalid => "candidate_invalid",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StrictDelegationTrace {
+    pub(crate) delegate_called: bool,
+    pub(crate) delegate_skip_reason: StrictDelegationSkipReason,
+}
+
+impl StrictDelegationTrace {
+    pub(crate) fn default_for_action(action: StrictDelegationManualAction) -> Self {
+        let delegate_skip_reason = match action {
+            StrictDelegationManualAction::ApplyPatch => {
+                StrictDelegationSkipReason::SupervisorSelectedManualPatch
+            }
+            StrictDelegationManualAction::ShellWrite => {
+                StrictDelegationSkipReason::CandidateMissing
+            }
+        };
+        Self {
+            delegate_called: false,
+            delegate_skip_reason,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StrictDelegationViolation {
     pub(crate) reason: StrictDelegationViolationReason,
     pub(crate) has_completed_candidate: bool,
     pub(crate) candidate_count: usize,
+    pub(crate) delegate_trace: StrictDelegationTrace,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +123,59 @@ pub(crate) enum StrictCommandDecision {
 }
 
 impl StrictDelegationState {
+    pub(crate) fn trace_for_completed_turn(
+        &self,
+        tool_calls: u64,
+    ) -> Option<StrictDelegationTrace> {
+        if self.delegate_called || tool_calls > 0 {
+            return None;
+        }
+
+        Some(StrictDelegationTrace {
+            delegate_called: false,
+            delegate_skip_reason:
+                StrictDelegationSkipReason::SupervisorSelfRestrictedBeforeToolCall,
+        })
+    }
+
+    pub(crate) fn trace_for_manual_action(
+        &self,
+        action: StrictDelegationManualAction,
+    ) -> StrictDelegationTrace {
+        let delegate_skip_reason = if !self.delegate_called {
+            match action {
+                StrictDelegationManualAction::ApplyPatch => {
+                    StrictDelegationSkipReason::SupervisorSelectedManualPatch
+                }
+                StrictDelegationManualAction::ShellWrite => {
+                    StrictDelegationSkipReason::CandidateMissing
+                }
+            }
+        } else {
+            match self.last_status {
+                Some(StrictDelegationAttemptStatus::Invalid)
+                | Some(StrictDelegationAttemptStatus::InfraError) => {
+                    StrictDelegationSkipReason::CandidateInvalid
+                }
+                Some(StrictDelegationAttemptStatus::Clarify) => {
+                    StrictDelegationSkipReason::CandidateMissing
+                }
+                Some(StrictDelegationAttemptStatus::Completed) if self.candidates.is_empty() => {
+                    StrictDelegationSkipReason::CandidateMissing
+                }
+                Some(StrictDelegationAttemptStatus::Completed) => {
+                    StrictDelegationSkipReason::SupervisorSelectedManualPatch
+                }
+                None => StrictDelegationSkipReason::CandidateMissing,
+            }
+        };
+
+        StrictDelegationTrace {
+            delegate_called: self.delegate_called,
+            delegate_skip_reason,
+        }
+    }
+
     pub(crate) fn record_delegate_response(
         &mut self,
         tool_name: &str,
@@ -125,6 +241,8 @@ impl StrictDelegationState {
                 reason: StrictDelegationViolationReason::NoCompletedCandidate,
                 has_completed_candidate: false,
                 candidate_count: 0,
+                delegate_trace: self
+                    .trace_for_manual_action(StrictDelegationManualAction::ApplyPatch),
             });
         }
 
@@ -140,6 +258,8 @@ impl StrictDelegationState {
                 reason: StrictDelegationViolationReason::PatchMismatch,
                 has_completed_candidate: true,
                 candidate_count: self.candidates.len(),
+                delegate_trace: self
+                    .trace_for_manual_action(StrictDelegationManualAction::ApplyPatch),
             })
         }
     }
@@ -467,7 +587,9 @@ mod tests {
     use super::STRICT_DELEGATION_SHELL_BLOCK_MESSAGE;
     use super::StrictCommandDecision;
     use super::StrictDelegationAttemptStatus;
+    use super::StrictDelegationSkipReason;
     use super::StrictDelegationState;
+    use super::StrictDelegationTrace;
     use super::check_shell_command_allowed_in_strict_delegation;
     use super::check_shell_text_allowed_in_strict_delegation;
     use super::normalize_patch_candidate;
@@ -553,6 +675,21 @@ mod tests {
                 .validate_apply_patch("*** Begin Patch\n*** End Patch")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn completed_turn_without_tool_calls_emits_self_restricted_trace() {
+        let state = StrictDelegationState::default();
+
+        assert_eq!(
+            state.trace_for_completed_turn(/*tool_calls*/ 0),
+            Some(StrictDelegationTrace {
+                delegate_called: false,
+                delegate_skip_reason:
+                    StrictDelegationSkipReason::SupervisorSelfRestrictedBeforeToolCall,
+            })
+        );
+        assert_eq!(state.trace_for_completed_turn(/*tool_calls*/ 1), None);
     }
 
     #[test]
