@@ -1,6 +1,5 @@
 use crate::client_common::Prompt;
 use codex_api::ResponseEvent;
-use codex_apply_patch::parse_patch;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::error::Result as CodexResult;
@@ -16,6 +15,10 @@ use std::path::Path;
 
 mod context_packer;
 mod git_status;
+mod response_parser;
+#[cfg(test)]
+#[path = "minimax_delegate/response_parser_tests.rs"]
+mod response_parser_tests;
 use context_packer::ContextPack;
 use context_packer::ContextPackRequest;
 use context_packer::ContextPacker;
@@ -63,7 +66,8 @@ WORKFLOW:
    - When `include_modified_files=true`, review `context_summary` and `diagnostics` before applying anything
    - If `status=completed`: review the patch before applying it, then apply it yourself with the normal Codex tools only if it looks correct
    - If `status=clarify`: do not apply anything; ask the user or gather the missing file/context, then retry only after you have new information
-   - If `status=invalid`: do not apply anything; if the error is invalid format you may retry once with stricter instructions, and if the error is insufficient context you should attach the relevant files before retrying
+   - If `status=invalid`: do not apply anything; if the error is invalid format you may retry once with stricter JSON-only instructions and explicitly request `patch_lines` when JSON escaping is the likely failure mode
+   - If `status=invalid` reports `patch_not_applicable`, retry only after refreshing `context_files`, `include_modified_files`, or the task description with exact current file context
    - Do not read, diff, cat, print, or otherwise expose sensitive files such as `.env`, `auth.json`, private keys, or credential files
    - If required files were omitted, attach them explicitly on retry; if sensitive files were denied, do not try to force them into MiniMax
    - If a command was blocked for a sensitive path, do not try to evade the guardrail with another command; rely on `context_summary`/`diagnostics` or ask the user for abstract guidance
@@ -79,7 +83,8 @@ Complete the requested implementation directly when the task is clear.
 Return exactly one JSON object and nothing else.
 
 Allowed responses:
-{"status":"completed","format":"apply_patch","summary":"<brief summary>","patch":"*** Begin Patch\n...\n*** End Patch","diagnostics":["optional diagnostics"]}
+{"status":"completed","format":"apply_patch","summary":"<brief summary>","patch":"*** Begin Patch\\n...\\n*** End Patch","diagnostics":["optional diagnostics"]}
+{"status":"completed","format":"apply_patch","summary":"<brief summary>","patch_lines":["*** Begin Patch","...","*** End Patch"],"diagnostics":["optional diagnostics"]}
 {"status":"clarify","question":"<question>","diagnostics":["optional diagnostics"]}
 {"status":"invalid","error":"<brief reason>","diagnostics":["optional diagnostics"]}
 
@@ -87,15 +92,26 @@ Rules:
 - Use only the provided context.
 - Some context files may have been included because they are currently modified in git; treat them as local-state hints, not proof that you saw the whole repository.
 - Do not assume you saw the entire repository.
+- Return only one JSON object and nothing else.
+- Do not use markdown fences.
+- Do not use shell commands.
+- Do not emit `apply_patch <<EOF`, `apply_patch <<'PATCH'`, or other heredoc wrappers.
+- Do not explain anything outside the JSON object.
 - Do not invent files that are not shown, unless creating a new file is explicitly necessary to complete the requested change.
 - If critical context is missing, truncated, or ambiguous, respond with `status":"clarify"` instead of guessing.
 - Use `status":"invalid"` when the request or available context is not actionable as given and needs the supervisor to retry differently.
-- Use `apply_patch` whenever possible. Only use `unified_diff` when `apply_patch` is not practical.
+- For `status":"completed"`, return `format":"apply_patch"` with an exact apply_patch patch.
+- The patch must start with `*** Begin Patch` and end with `*** End Patch`.
+- Use `*** Update File: path` when modifying an existing file.
+- Copy old lines exactly from the provided context when writing `-` lines.
+- Do not use `...`, placeholders, or line numbers inside hunks.
+- If JSON escaping is awkward, use `patch_lines` instead of an invalid multiline JSON string.
+- If you cannot build an applicable patch from the provided context, return `status":"clarify"` or `status":"invalid"` instead of inventing a patch.
 - The summary must be brief and factual.
-- The patch must be valid for the declared format.
 - Do not invent missing requirements, APIs, or symbols.
 - Do not describe approval gates, terminal commands, or filesystem mutations.
-- Do not include markdown fences, prose, or explanations outside the required JSON object."#;
+- Example valid response:
+{"status":"completed","format":"apply_patch","summary":"Fix add implementation.","patch":"*** Begin Patch\\n*** Update File: src/lib.rs\\n@@\\n-pub fn add(a: i32, b: i32) -> i32 { a - b }\\n+pub fn add(a: i32, b: i32) -> i32 { a + b }\\n*** End Patch","diagnostics":[]}"#;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DelegateToMinimaxRequest {
@@ -336,11 +352,12 @@ pub async fn delegate_to_minimax(
 
     let output = collect_stream_text(&mut stream).await?;
     let context_summary = build_context_summary(&context_pack);
-    Ok(parse_delegate_output(
+    let result = parse_delegate_output(
         output.as_str(),
         &context_pack.diagnostics.messages,
         context_summary,
-    ))
+    );
+    Ok(validate_delegate_result_against_worktree(result, cwd).await)
 }
 
 fn render_delegate_request(
@@ -413,7 +430,7 @@ fn render_delegate_request(
     let _ = writeln!(text, "- Return exactly one JSON object and nothing else.");
     let _ = writeln!(
         text,
-        "- If the task is clear, return: {{\"status\":\"completed\",\"format\":\"apply_patch\"|\"unified_diff\",\"summary\":\"...\",\"patch\":\"...\",\"diagnostics\":[\"...\"]}}."
+        "- If the task is clear, return completed JSON with `format: \"apply_patch\"` plus either `patch` with escaped `\\n` newlines or `patch_lines` as an array of lines."
     );
     let _ = writeln!(
         text,
@@ -430,11 +447,19 @@ fn render_delegate_request(
     );
     let _ = writeln!(
         text,
-        "- Use `format: \"apply_patch\"` whenever possible. Only use `\"unified_diff\"` when needed."
+        "- Do not include markdown fences, prose, or explanations outside the JSON object."
     );
     let _ = writeln!(
         text,
-        "- Do not include markdown fences or any prose outside the JSON object."
+        "- Do not use shell commands or heredoc wrappers such as `apply_patch <<'PATCH' ... PATCH`."
+    );
+    let _ = writeln!(
+        text,
+        "- For existing files, use `*** Update File: path`, copy `-` lines exactly from the context above, and do not use `...`, placeholders, or line numbers inside hunks."
+    );
+    let _ = writeln!(
+        text,
+        "- If the provided context is not enough to build an applicable patch, return `status\":\"clarify\"` or `status\":\"invalid\"` instead of guessing."
     );
     text
 }
@@ -467,185 +492,19 @@ fn build_context_summary(context_pack: &ContextPack) -> Option<MiniMaxContextSum
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawWorkerResponse {
-    status: MiniMaxDelegationStatus,
-    #[serde(default)]
-    format: Option<WorkerPatchFormat>,
-    #[serde(default)]
-    summary: Option<String>,
-    #[serde(default)]
-    patch: Option<String>,
-    #[serde(default)]
-    question: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    diagnostics: Vec<String>,
-}
-
 fn parse_delegate_output(
     output: &str,
     context_diagnostics: &[String],
     context_summary: Option<MiniMaxContextSummary>,
 ) -> DelegateToMinimaxResponse {
-    let trimmed = output.trim();
-
-    if trimmed.is_empty() {
-        return MiniMaxDelegationResult::invalid_with_context_summary(
-            "MiniMax returned no output for delegate_to_minimax.".to_string(),
-            context_diagnostics.to_vec(),
-            context_summary,
-        );
-    }
-
-    if let Some(question) = trimmed.strip_prefix(CLARIFY_PREFIX) {
-        return MiniMaxDelegationResult::clarify(
-            question.trim().to_string(),
-            context_diagnostics.to_vec(),
-            context_summary,
-        );
-    }
-
-    let response = match serde_json::from_str::<RawWorkerResponse>(trimmed) {
-        Ok(response) => response,
-        Err(_) => {
-            if let Some(format) = detect_patch_format(trimmed) {
-                return MiniMaxDelegationResult::invalid_with_context_summary(
-                    format!(
-                        "MiniMax returned a raw {} patch instead of the required JSON object.",
-                        format.as_str()
-                    ),
-                    context_diagnostics.to_vec(),
-                    context_summary,
-                );
-            }
-
-            return MiniMaxDelegationResult::invalid_with_context_summary(
-                "MiniMax returned invalid output: expected JSON with status `completed`, `clarify`, or `invalid`."
-                    .to_string(),
-                context_diagnostics.to_vec(),
-                context_summary,
-            );
-        }
-    };
-
-    let mut diagnostics = context_diagnostics.to_vec();
-    diagnostics.extend(response.diagnostics.iter().cloned());
-
-    match response.status {
-        MiniMaxDelegationStatus::Completed => {
-            let Some(format) = response.format else {
-                return MiniMaxDelegationResult::invalid_with_context_summary(
-                    "MiniMax returned status `completed` without a patch format.".to_string(),
-                    diagnostics,
-                    context_summary,
-                );
-            };
-
-            let summary = response.summary.unwrap_or_default().trim().to_string();
-            if summary.is_empty() {
-                return MiniMaxDelegationResult::invalid_with_context_summary(
-                    "MiniMax returned a patch candidate without a summary.".to_string(),
-                    diagnostics,
-                    context_summary,
-                );
-            }
-
-            let patch = response.patch.unwrap_or_default().trim().to_string();
-            if patch.is_empty() {
-                return MiniMaxDelegationResult::invalid_with_context_summary(
-                    "MiniMax returned a patch candidate without patch content.".to_string(),
-                    diagnostics,
-                    context_summary,
-                );
-            }
-
-            if let Err(error) = validate_patch_candidate(&format, patch.as_str()) {
-                let mut diagnostics = diagnostics;
-                diagnostics.push(error);
-                return MiniMaxDelegationResult::invalid_with_context_summary(
-                    format!(
-                        "MiniMax returned an invalid {} patch candidate.",
-                        format.as_str()
-                    ),
-                    diagnostics,
-                    context_summary,
-                );
-            }
-
-            MiniMaxDelegationResult::completed(format, summary, patch, diagnostics, context_summary)
-        }
-        MiniMaxDelegationStatus::Clarify => {
-            let question = response.question.unwrap_or_default().trim().to_string();
-            if question.is_empty() {
-                return MiniMaxDelegationResult::invalid_with_context_summary(
-                    "MiniMax returned status `clarify` without a question.".to_string(),
-                    diagnostics,
-                    context_summary,
-                );
-            }
-
-            MiniMaxDelegationResult::clarify(question, diagnostics, context_summary)
-        }
-        MiniMaxDelegationStatus::Invalid => {
-            let error = response.error.unwrap_or_default().trim().to_string();
-            let error = if error.is_empty() {
-                "MiniMax returned status `invalid` without an error message.".to_string()
-            } else {
-                error
-            };
-            MiniMaxDelegationResult::invalid_with_context_summary(
-                error,
-                diagnostics,
-                context_summary,
-            )
-        }
-    }
+    response_parser::parse_delegate_output(output, context_diagnostics, context_summary)
 }
 
-fn validate_patch_candidate(format: &WorkerPatchFormat, patch: &str) -> Result<(), String> {
-    match format {
-        WorkerPatchFormat::ApplyPatch => {
-            let parsed = parse_patch(patch)
-                .map_err(|err| format!("apply_patch validation failed: {err}"))?;
-            if parsed.hunks.is_empty() {
-                return Err(
-                    "apply_patch validation failed: patch contained no file operations."
-                        .to_string(),
-                );
-            }
-            Ok(())
-        }
-        WorkerPatchFormat::UnifiedDiff => {
-            let has_diff_header = patch.contains("diff --git");
-            let has_file_headers = patch.contains("--- ") && patch.contains("+++ ");
-            let has_hunk = patch.contains("@@");
-            if has_diff_header || has_file_headers || has_hunk {
-                Ok(())
-            } else {
-                Err("unified diff validation failed: expected `diff --git`, `---`/`+++`, or `@@` markers.".to_string())
-            }
-        }
-    }
-}
-
-fn detect_patch_format(output: &str) -> Option<WorkerPatchFormat> {
-    if let Ok(parsed) = parse_patch(output)
-        && !parsed.hunks.is_empty()
-    {
-        return Some(WorkerPatchFormat::ApplyPatch);
-    }
-
-    let has_diff_header = output.contains("diff --git");
-    let has_file_headers = output.contains("--- ") && output.contains("+++ ");
-    let has_hunk = output.contains("@@");
-    if has_diff_header || has_file_headers || has_hunk {
-        Some(WorkerPatchFormat::UnifiedDiff)
-    } else {
-        None
-    }
+async fn validate_delegate_result_against_worktree(
+    result: DelegateToMinimaxResponse,
+    cwd: &Path,
+) -> DelegateToMinimaxResponse {
+    response_parser::validate_delegate_result_against_worktree(result, cwd).await
 }
 
 async fn collect_stream_text(
@@ -917,8 +776,8 @@ mod tests {
                 patch: None,
                 question: None,
                 error: Some(
-                    "MiniMax returned invalid output: expected JSON with status `completed`, `clarify`, or `invalid`."
-                        .to_string()
+                    "worker_response_not_json: expected JSON object with status completed/clarify/invalid"
+                        .to_string(),
                 ),
                 diagnostics: Vec::new(),
                 context_summary: None,
@@ -1136,6 +995,7 @@ mod tests {
         assert!(prompt.contains("include_modified_files"));
         assert!(prompt.contains("secrets, credentials, auth, tokens"));
         assert!(prompt.contains("Do not read, diff, cat, print"));
+        assert!(prompt.contains("patch_lines"));
     }
 
     #[test]
@@ -1164,5 +1024,7 @@ mod tests {
         assert!(
             MINIMAX_DELEGATE_SYSTEM_PROMPT.contains("Do not assume you saw the entire repository")
         );
+        assert!(MINIMAX_DELEGATE_SYSTEM_PROMPT.contains("patch_lines"));
+        assert!(MINIMAX_DELEGATE_SYSTEM_PROMPT.contains("Do not emit `apply_patch <<EOF`"));
     }
 }

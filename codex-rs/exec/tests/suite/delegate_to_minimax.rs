@@ -399,6 +399,118 @@ async fn exec_services_delegate_to_minimax_dynamic_tool_call() -> anyhow::Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exec_services_delegate_to_minimax_normalizes_patch_lines() -> anyhow::Result<()> {
+    let _lock = lock_minimax_env().await;
+    let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
+    let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
+
+    let test = test_codex_exec();
+    init_add_repo(test.cwd_path())?;
+    save_minimax_credentials(test.home_path());
+
+    let supervisor_server = responses::start_mock_server().await;
+    let minimax_server = MockServer::start().await;
+    let minimax_base_url = format!("{}/v1", minimax_server.uri());
+    let _minimax_base_url = EnvVarGuard::set("MINIMAX_BASE_URL", OsStr::new(&minimax_base_url));
+
+    responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| {
+            !request_has_function_call_output(req, DELEGATE_CALL_ID)
+                && !request_has_function_call_output(req, APPLY_CALL_ID)
+        },
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call(
+                DELEGATE_CALL_ID,
+                "delegate_to_minimax",
+                &delegate_arguments(
+                    "Fix add so it returns the sum of both inputs.",
+                    &["cargo test must pass"],
+                    &["src/lib.rs"],
+                ),
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_supervisor = responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| request_has_function_call_output(req, DELEGATE_CALL_ID),
+        responses::sse(vec![
+            responses::ev_response_created("resp-2"),
+            responses::ev_apply_patch_function_call(APPLY_CALL_ID, FIX_ADD_PATCH),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| request_has_function_call_output(req, APPLY_CALL_ID),
+        responses::sse(vec![
+            responses::ev_response_created("resp-3"),
+            responses::ev_assistant_message("msg-1", "Patch applied."),
+            responses::ev_completed("resp-3"),
+        ]),
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(minimax_stream_body(
+                    r#"{"status":"completed","format":"apply_patch","summary":"Fix add","patch_lines":["*** Begin Patch","*** Update File: src/lib.rs","@@","-pub fn add(a: i32, b: i32) -> i32 { a - b }","+pub fn add(a: i32, b: i32) -> i32 { a + b }","*** End Patch"],"diagnostics":[]}"#,
+                )),
+        )
+        .expect(1)
+        .mount(&minimax_server)
+        .await;
+
+    test.cmd_with_server(&supervisor_server)
+        .env_remove("MINIMAX_API_KEY")
+        .env_remove("MINIMAX_CODING_PLAN_KEY")
+        .arg("--skip-git-repo-check")
+        .arg("-s")
+        .arg("danger-full-access")
+        .arg("use delegate_to_minimax to fix add")
+        .assert()
+        .success();
+
+    let second_request = second_supervisor.single_request();
+    let (delegate_output, delegate_success) = second_request
+        .function_call_output_content_and_success(DELEGATE_CALL_ID)
+        .expect("delegate output should be present");
+    assert_ne!(delegate_success, Some(false));
+    let delegate_output = delegate_output.expect("delegate output should contain text");
+    let delegate_json: Value =
+        serde_json::from_str(&delegate_output).expect("delegate output should be valid JSON");
+    assert_eq!(delegate_json["status"], "completed");
+    assert_eq!(
+        delegate_json["patch"],
+        Value::String(FIX_ADD_PATCH.trim_end().to_string())
+    );
+    assert!(
+        delegate_json["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics.iter().any(|item| {
+                item.as_str()
+                    == Some("normalized worker patch: joined patch_lines into patch string")
+            }))
+    );
+
+    let final_source = fs::read_to_string(test.cwd_path().join("src/lib.rs"))?;
+    assert_eq!(
+        final_source,
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"
+    );
+    run_cargo_test(test.cwd_path())?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_services_delegate_to_minimax_dynamic_tool_call_clarify() -> anyhow::Result<()> {
     let _lock = lock_minimax_env().await;
     let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
@@ -556,7 +668,7 @@ async fn exec_services_delegate_to_minimax_dynamic_tool_call_invalid() -> anyhow
     assert_eq!(delegate_json["status"], "invalid");
     assert_eq!(
         delegate_json["error"],
-        "MiniMax returned invalid output: expected JSON with status `completed`, `clarify`, or `invalid`."
+        "worker_response_not_json: expected JSON object with status completed/clarify/invalid"
     );
 
     Ok(())

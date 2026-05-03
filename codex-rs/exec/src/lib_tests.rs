@@ -533,6 +533,8 @@ async fn thread_start_params_include_strict_delegation_instructions_when_enabled
     assert!(
         developer_instructions.contains("only apply that exact patch candidate with `apply_patch`")
     );
+    assert!(developer_instructions.contains("patch_lines"));
+    assert!(developer_instructions.contains("patch_not_applicable"));
 }
 
 #[tokio::test]

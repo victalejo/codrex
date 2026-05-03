@@ -158,7 +158,9 @@ const STRICT_DELEGATION_DEVELOPER_INSTRUCTIONS: &str = r#"Strict delegation mode
 - Do not use shell/unified_exec to modify files or bypass strict delegation.
 - You may use shell/unified_exec to inspect files, gather context, and run tests.
 - If `delegate_to_minimax` returns `status="completed"` with `format="apply_patch"`, review `context_summary`, `diagnostics`, and the patch, then only apply that exact patch candidate with `apply_patch`.
-- If `delegate_to_minimax` returns `status="invalid"`, you may retry with stricter instructions or better context, but do not invent and apply your own patch.
+- If `delegate_to_minimax` returns `status="invalid"` because of format or JSON-contract diagnostics, you may retry once with stricter JSON-only instructions and explicitly request `patch_lines` when escaping looks brittle.
+- If `delegate_to_minimax` returns `status="invalid"` with `patch_not_applicable`, refresh `context_files`, `include_modified_files`, or the exact current file context before retrying.
+- If `delegate_to_minimax` returns `status="invalid"`, do not invent and apply your own patch.
 - If `delegate_to_minimax` returns `status="clarify"`, ask the user the question or end with the question. Do not apply a patch.
 - If MiniMax delegation fails, report the failure. Do not fall back to a manual fix.
 - If a shell/unified_exec write is blocked, do not try to evade it. Report that you need a valid completed patch candidate from `delegate_to_minimax`."#;

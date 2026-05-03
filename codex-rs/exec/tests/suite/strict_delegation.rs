@@ -847,6 +847,234 @@ async fn strict_delegation_allows_exact_completed_patch_candidate() -> anyhow::R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_delegation_allows_normalized_heredoc_candidate() -> anyhow::Result<()> {
+    let _lock = lock_minimax_env().await;
+    let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
+    let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
+
+    let test = test_codex_exec();
+    init_add_repo(test.cwd_path())?;
+    save_minimax_credentials(test.home_path());
+
+    let supervisor_server = responses::start_mock_server().await;
+    let minimax_server = MockServer::start().await;
+    let minimax_base_url = format!("{}/v1", minimax_server.uri());
+    let _minimax_base_url = EnvVarGuard::set("MINIMAX_BASE_URL", OsStr::new(&minimax_base_url));
+
+    responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| {
+            !request_has_function_call_output(req, DELEGATE_CALL_ID)
+                && !request_has_function_call_output(req, APPLY_CALL_ID)
+        },
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call(
+                DELEGATE_CALL_ID,
+                "delegate_to_minimax",
+                &delegate_arguments(
+                    "Fix add so it returns the sum of both inputs.",
+                    &["cargo test must pass"],
+                    &["src/lib.rs"],
+                ),
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let after_delegate = responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| {
+            request_has_function_call_output(req, DELEGATE_CALL_ID)
+                && !request_has_function_call_output(req, APPLY_CALL_ID)
+        },
+        responses::sse(vec![
+            responses::ev_response_created("resp-2"),
+            responses::ev_apply_patch_function_call(APPLY_CALL_ID, FIX_ADD_PATCH),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    let after_apply = responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| request_has_function_call_output(req, APPLY_CALL_ID),
+        responses::sse(vec![
+            responses::ev_response_created("resp-3"),
+            responses::ev_assistant_message("msg-1", "Applied the normalized delegated patch."),
+            responses::ev_completed("resp-3"),
+        ]),
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(minimax_stream_body(
+                    r#"{"status":"completed","format":"apply_patch","summary":"Fix add","patch":"apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn add(a: i32, b: i32) -> i32 { a - b }\n+pub fn add(a: i32, b: i32) -> i32 { a + b }\n*** End Patch\nPATCH","diagnostics":[]}"#,
+                )),
+        )
+        .expect(1)
+        .mount(&minimax_server)
+        .await;
+
+    let output = run_exec(
+        &test,
+        &supervisor_server,
+        /*strict_delegation*/ true,
+        "fix add with strict delegation",
+    )?;
+    assert!(
+        output.status.success(),
+        "codex-exec failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let delegate_request = after_delegate.single_request();
+    let (delegate_output, delegate_success) = apply_output(&delegate_request, DELEGATE_CALL_ID);
+    assert_ne!(delegate_success, Some(false));
+    let delegate_json: Value =
+        serde_json::from_str(delegate_output.as_deref().expect("delegate output text"))?;
+    assert_eq!(delegate_json["status"], "completed");
+    assert_eq!(
+        delegate_json["patch"],
+        Value::String(FIX_ADD_PATCH.trim_end().to_string())
+    );
+    assert!(
+        delegate_json["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics.iter().any(|item| {
+                item.as_str() == Some("normalized worker patch: extracted apply_patch heredoc")
+            }))
+    );
+
+    let apply_request = after_apply.single_request();
+    let (_apply_output, apply_success) = apply_output(&apply_request, APPLY_CALL_ID);
+    assert_ne!(apply_success, Some(false));
+
+    let final_source = fs::read_to_string(test.cwd_path().join("src/lib.rs"))?;
+    assert_eq!(
+        final_source,
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"
+    );
+    run_cargo_test(test.cwd_path())?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_delegation_blocks_manual_apply_after_non_applicable_delegate_result()
+-> anyhow::Result<()> {
+    let _lock = lock_minimax_env().await;
+    let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
+    let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
+
+    let test = test_codex_exec();
+    init_add_repo(test.cwd_path())?;
+    save_minimax_credentials(test.home_path());
+
+    let supervisor_server = responses::start_mock_server().await;
+    let minimax_server = MockServer::start().await;
+    let minimax_base_url = format!("{}/v1", minimax_server.uri());
+    let _minimax_base_url = EnvVarGuard::set("MINIMAX_BASE_URL", OsStr::new(&minimax_base_url));
+
+    responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| {
+            !request_has_function_call_output(req, DELEGATE_CALL_ID)
+                && !request_has_function_call_output(req, APPLY_CALL_ID)
+        },
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call(
+                DELEGATE_CALL_ID,
+                "delegate_to_minimax",
+                &delegate_arguments(
+                    "Fix add so it returns the sum of both inputs.",
+                    &["cargo test must pass"],
+                    &["src/lib.rs"],
+                ),
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let after_delegate = responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| {
+            request_has_function_call_output(req, DELEGATE_CALL_ID)
+                && !request_has_function_call_output(req, APPLY_CALL_ID)
+        },
+        responses::sse(vec![
+            responses::ev_response_created("resp-2"),
+            responses::ev_apply_patch_function_call(APPLY_CALL_ID, FIX_ADD_PATCH),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    let after_apply = responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| request_has_function_call_output(req, APPLY_CALL_ID),
+        responses::sse(vec![
+            responses::ev_response_created("resp-3"),
+            responses::ev_assistant_message(
+                "msg-1",
+                "Strict delegation blocked manual apply after a non-applicable candidate.",
+            ),
+            responses::ev_completed("resp-3"),
+        ]),
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(minimax_stream_body(
+                    r#"{"status":"completed","format":"apply_patch","summary":"Fix add","patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@ -1,5 +1,5 @@\n-pub fn add(a: i32, b: i32) -> i32 {\n-    a - b\n-}\n+pub fn add(a: i32, b: i32) -> i32 {\n+    a + b\n+}\n*** End Patch","diagnostics":[]}"#,
+                )),
+        )
+        .expect(1)
+        .mount(&minimax_server)
+        .await;
+
+    let output = run_exec(
+        &test,
+        &supervisor_server,
+        /*strict_delegation*/ true,
+        "fix add with strict delegation",
+    )?;
+    assert!(
+        output.status.success(),
+        "codex-exec failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let delegate_request = after_delegate.single_request();
+    let (delegate_output, delegate_success) = apply_output(&delegate_request, DELEGATE_CALL_ID);
+    assert_ne!(delegate_success, Some(false));
+    let delegate_json: Value =
+        serde_json::from_str(delegate_output.as_deref().expect("delegate output text"))?;
+    assert_eq!(delegate_json["status"], "invalid");
+    assert_eq!(
+        delegate_json["error"],
+        "patch_not_applicable: context did not match src/lib.rs"
+    );
+
+    let apply_request = after_apply.single_request();
+    let (apply_output, apply_success) = apply_output(&apply_request, APPLY_CALL_ID);
+    assert_ne!(apply_success, Some(true));
+    assert_eq!(apply_output.as_deref(), Some(STRICT_BLOCK_MESSAGE));
+    assert_file_unchanged(&test);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strict_delegation_blocks_shell_write_even_with_completed_candidate() -> anyhow::Result<()>
 {
     let _lock = lock_minimax_env().await;
