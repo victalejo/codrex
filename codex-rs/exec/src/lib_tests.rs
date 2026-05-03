@@ -529,6 +529,10 @@ async fn thread_start_params_include_strict_delegation_instructions_when_enabled
     assert!(developer_instructions.contains("Stay inside the repo."));
     assert!(developer_instructions.contains(STRICT_DELEGATION_MARKER));
     assert!(developer_instructions.contains("Strict delegation mode is active"));
+    assert!(developer_instructions.contains("Do not use shell/unified_exec"));
+    assert!(
+        developer_instructions.contains("only apply that exact patch candidate with `apply_patch`")
+    );
 }
 
 #[tokio::test]

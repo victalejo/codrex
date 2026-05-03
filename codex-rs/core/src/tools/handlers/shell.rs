@@ -13,6 +13,9 @@ use crate::maybe_emit_implicit_skill_invocation;
 use crate::sensitive_output::sensitive_command_block;
 use crate::session::turn_context::TurnContext;
 use crate::shell::Shell;
+use crate::strict_delegation::StrictCommandDecision;
+use crate::strict_delegation::check_shell_command_allowed_in_strict_delegation;
+use crate::strict_delegation::strict_delegation_enabled;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -419,6 +422,23 @@ impl ShellHandler {
             ));
         };
         let fs = environment.get_filesystem();
+
+        if strict_delegation_enabled(turn.developer_instructions.as_deref()) {
+            match check_shell_command_allowed_in_strict_delegation(&exec_params.command) {
+                StrictCommandDecision::Allow => {}
+                StrictCommandDecision::Block {
+                    reason,
+                    command_kind,
+                } => {
+                    tracing::warn!(
+                        reason = reason.as_str(),
+                        command_kind,
+                        "strict delegation blocked shell command"
+                    );
+                    return Err(FunctionCallError::RespondToModel(reason));
+                }
+            }
+        }
 
         let dependency_env = session.dependency_env().await;
         if !dependency_env.is_empty() {

@@ -5,6 +5,10 @@ use crate::sensitive_output::sensitive_command_block;
 use crate::sensitive_output::sensitive_command_block_from_text;
 use crate::shell::Shell;
 use crate::shell::get_shell_by_model_provided_path;
+use crate::strict_delegation::StrictCommandDecision;
+use crate::strict_delegation::check_shell_command_allowed_in_strict_delegation;
+use crate::strict_delegation::check_shell_text_allowed_in_strict_delegation;
+use crate::strict_delegation::strict_delegation_enabled;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -231,6 +235,24 @@ impl ToolHandler for UnifiedExecHandler {
                 .map_err(FunctionCallError::RespondToModel)?;
                 let command_for_display = codex_shell_command::parse_command::shlex_join(&command);
 
+                if strict_delegation_enabled(turn.developer_instructions.as_deref()) {
+                    match check_shell_command_allowed_in_strict_delegation(&command) {
+                        StrictCommandDecision::Allow => {}
+                        StrictCommandDecision::Block {
+                            reason,
+                            command_kind,
+                        } => {
+                            tracing::warn!(
+                                reason = reason.as_str(),
+                                command_kind,
+                                "strict delegation blocked unified exec command"
+                            );
+                            manager.release_process_id(process_id).await;
+                            return Err(FunctionCallError::RespondToModel(reason));
+                        }
+                    }
+                }
+
                 let ExecCommandArgs {
                     workdir,
                     tty,
@@ -388,6 +410,22 @@ impl ToolHandler for UnifiedExecHandler {
             }
             "write_stdin" => {
                 let args: WriteStdinArgs = parse_arguments(&arguments)?;
+                if strict_delegation_enabled(turn.developer_instructions.as_deref()) {
+                    match check_shell_text_allowed_in_strict_delegation(args.chars.as_str()) {
+                        StrictCommandDecision::Allow => {}
+                        StrictCommandDecision::Block {
+                            reason,
+                            command_kind,
+                        } => {
+                            tracing::warn!(
+                                reason = reason.as_str(),
+                                command_kind,
+                                "strict delegation blocked unified exec stdin"
+                            );
+                            return Err(FunctionCallError::RespondToModel(reason));
+                        }
+                    }
+                }
                 if let Some(blocked) = sensitive_command_block_from_text(args.chars.as_str()) {
                     return Err(FunctionCallError::RespondToModel(blocked.message));
                 }

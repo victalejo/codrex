@@ -32,9 +32,13 @@ static MINIMAX_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 const DELEGATE_CALL_ID: &str = "delegate-call";
 const DELEGATE_RETRY_CALL_ID: &str = "delegate-call-retry";
 const APPLY_CALL_ID: &str = "apply-call";
+const SHELL_WRITE_CALL_ID: &str = "shell-write-call";
 const FIX_ADD_PATCH: &str = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn add(a: i32, b: i32) -> i32 { a - b }\n+pub fn add(a: i32, b: i32) -> i32 { a + b }\n*** End Patch\n";
 const ALT_ADD_PATCH: &str = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn add(a: i32, b: i32) -> i32 { a - b }\n+pub fn add(a: i32, b: i32) -> i32 { a * b }\n*** End Patch\n";
 const STRICT_BLOCK_MESSAGE: &str = "blocked: strict delegation mode requires applying a completed patch candidate returned by delegate_to_minimax. No matching candidate is available.";
+const STRICT_SHELL_BLOCK_MESSAGE: &str = "blocked: strict delegation mode forbids manual file modifications via shell. Apply a completed patch candidate returned by delegate_to_minimax instead.";
+const SHELL_REWRITE_LIB_RS_COMMAND: &str =
+    "cat <<'EOF' > src/lib.rs\npub fn add(a: i32, b: i32) -> i32 { a + b }\nEOF\n";
 
 struct EnvVarGuard {
     key: &'static str,
@@ -259,6 +263,64 @@ async fn strict_delegation_off_allows_manual_apply_patch() -> anyhow::Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_delegation_off_allows_manual_shell_write() -> anyhow::Result<()> {
+    let _lock = lock_minimax_env().await;
+    let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
+    let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
+
+    let test = test_codex_exec();
+    init_add_repo(test.cwd_path())?;
+
+    let supervisor_server = responses::start_mock_server().await;
+    responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| !request_has_function_call_output(req, SHELL_WRITE_CALL_ID),
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_shell_command_call(SHELL_WRITE_CALL_ID, SHELL_REWRITE_LIB_RS_COMMAND),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let after_shell = responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| request_has_function_call_output(req, SHELL_WRITE_CALL_ID),
+        responses::sse(vec![
+            responses::ev_response_created("resp-2"),
+            responses::ev_assistant_message("msg-1", "Edited src/lib.rs via shell."),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let output = run_exec(
+        &test,
+        &supervisor_server,
+        /*strict_delegation*/ false,
+        "rewrite add via shell",
+    )?;
+    assert!(
+        output.status.success(),
+        "codex-exec failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let shell_request = after_shell.single_request();
+    let (_shell_output, shell_success) = apply_output(&shell_request, SHELL_WRITE_CALL_ID);
+    assert_ne!(shell_success, Some(false));
+
+    let final_source = fs::read_to_string(test.cwd_path().join("src/lib.rs"))?;
+    assert_eq!(
+        final_source,
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"
+    );
+    run_cargo_test(test.cwd_path())?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strict_delegation_blocks_apply_patch_without_delegate_call() -> anyhow::Result<()> {
     let _lock = lock_minimax_env().await;
     let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
@@ -306,6 +368,59 @@ async fn strict_delegation_blocks_apply_patch_without_delegate_call() -> anyhow:
     let (apply_output, apply_success) = apply_output(&request, APPLY_CALL_ID);
     assert_ne!(apply_success, Some(true));
     assert_eq!(apply_output.as_deref(), Some(STRICT_BLOCK_MESSAGE));
+    assert_file_unchanged(&test);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_delegation_blocks_manual_shell_write() -> anyhow::Result<()> {
+    let _lock = lock_minimax_env().await;
+    let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
+    let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
+
+    let test = test_codex_exec();
+    init_add_repo(test.cwd_path())?;
+
+    let supervisor_server = responses::start_mock_server().await;
+    responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| !request_has_function_call_output(req, SHELL_WRITE_CALL_ID),
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_shell_command_call(SHELL_WRITE_CALL_ID, SHELL_REWRITE_LIB_RS_COMMAND),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let after_shell = responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| request_has_function_call_output(req, SHELL_WRITE_CALL_ID),
+        responses::sse(vec![
+            responses::ev_response_created("resp-2"),
+            responses::ev_assistant_message("msg-1", "Strict delegation blocked shell write."),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let output = run_exec(
+        &test,
+        &supervisor_server,
+        /*strict_delegation*/ true,
+        "rewrite add via shell",
+    )?;
+    assert!(
+        output.status.success(),
+        "codex-exec failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let shell_request = after_shell.single_request();
+    let (shell_output, shell_success) = apply_output(&shell_request, SHELL_WRITE_CALL_ID);
+    assert_ne!(shell_success, Some(true));
+    assert_eq!(shell_output.as_deref(), Some(STRICT_SHELL_BLOCK_MESSAGE));
     assert_file_unchanged(&test);
 
     Ok(())
@@ -732,6 +847,112 @@ async fn strict_delegation_allows_exact_completed_patch_candidate() -> anyhow::R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_delegation_blocks_shell_write_even_with_completed_candidate() -> anyhow::Result<()>
+{
+    let _lock = lock_minimax_env().await;
+    let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
+    let _minimax_coding_plan_key = EnvVarGuard::clear("MINIMAX_CODING_PLAN_KEY");
+
+    let test = test_codex_exec();
+    init_add_repo(test.cwd_path())?;
+    save_minimax_credentials(test.home_path());
+
+    let supervisor_server = responses::start_mock_server().await;
+    let minimax_server = MockServer::start().await;
+    let minimax_base_url = format!("{}/v1", minimax_server.uri());
+    let _minimax_base_url = EnvVarGuard::set("MINIMAX_BASE_URL", OsStr::new(&minimax_base_url));
+
+    responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| {
+            !request_has_function_call_output(req, DELEGATE_CALL_ID)
+                && !request_has_function_call_output(req, SHELL_WRITE_CALL_ID)
+        },
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call(
+                DELEGATE_CALL_ID,
+                "delegate_to_minimax",
+                &delegate_arguments(
+                    "Fix add so it returns the sum of both inputs.",
+                    &["cargo test must pass"],
+                    &["src/lib.rs"],
+                ),
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let after_delegate = responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| {
+            request_has_function_call_output(req, DELEGATE_CALL_ID)
+                && !request_has_function_call_output(req, SHELL_WRITE_CALL_ID)
+        },
+        responses::sse(vec![
+            responses::ev_response_created("resp-2"),
+            responses::ev_shell_command_call(SHELL_WRITE_CALL_ID, SHELL_REWRITE_LIB_RS_COMMAND),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    let after_shell = responses::mount_sse_once_match(
+        &supervisor_server,
+        |req: &wiremock::Request| request_has_function_call_output(req, SHELL_WRITE_CALL_ID),
+        responses::sse(vec![
+            responses::ev_response_created("resp-3"),
+            responses::ev_assistant_message(
+                "msg-1",
+                "Strict delegation refused the shell bypass and kept the repo unchanged.",
+            ),
+            responses::ev_completed("resp-3"),
+        ]),
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(minimax_stream_body(
+                    r#"{"status":"completed","format":"apply_patch","summary":"Fix add","patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn add(a: i32, b: i32) -> i32 { a - b }\n+pub fn add(a: i32, b: i32) -> i32 { a + b }\n*** End Patch","diagnostics":[]}"#,
+                )),
+        )
+        .expect(1)
+        .mount(&minimax_server)
+        .await;
+
+    let output = run_exec(
+        &test,
+        &supervisor_server,
+        /*strict_delegation*/ true,
+        "fix add with strict delegation",
+    )?;
+    assert!(
+        output.status.success(),
+        "codex-exec failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let delegate_request = after_delegate.single_request();
+    let (delegate_output, delegate_success) = apply_output(&delegate_request, DELEGATE_CALL_ID);
+    assert_ne!(delegate_success, Some(false));
+    let delegate_json: Value =
+        serde_json::from_str(delegate_output.as_deref().expect("delegate output text"))?;
+    assert_eq!(delegate_json["status"], "completed");
+
+    let shell_request = after_shell.single_request();
+    let (shell_output, shell_success) = apply_output(&shell_request, SHELL_WRITE_CALL_ID);
+    assert_ne!(shell_success, Some(true));
+    assert_eq!(shell_output.as_deref(), Some(STRICT_SHELL_BLOCK_MESSAGE));
+    assert_file_unchanged(&test);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strict_delegation_blocks_different_patch_than_completed_candidate() -> anyhow::Result<()> {
     let _lock = lock_minimax_env().await;
     let _minimax_api_key = EnvVarGuard::clear("MINIMAX_API_KEY");
@@ -1003,10 +1224,20 @@ async fn strict_delegation_allows_retry_after_invalid_then_completed_delegate_re
 
 #[test]
 fn strict_delegation_block_message_stays_secret_free() {
-    for forbidden in [FIX_ADD_PATCH, ALT_ADD_PATCH, "OPENAI_API_KEY", ".env"] {
+    for forbidden in [
+        FIX_ADD_PATCH,
+        ALT_ADD_PATCH,
+        "OPENAI_API_KEY",
+        ".env",
+        SHELL_REWRITE_LIB_RS_COMMAND,
+    ] {
         assert!(
             !STRICT_BLOCK_MESSAGE.contains(forbidden),
             "strict delegation block message should stay safe"
+        );
+        assert!(
+            !STRICT_SHELL_BLOCK_MESSAGE.contains(forbidden),
+            "strict delegation shell block message should stay safe"
         );
     }
 }
