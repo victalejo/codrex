@@ -20,6 +20,7 @@ use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
 use crate::session::turn_context::TurnContext;
+use crate::strict_delegation::StrictDelegationState;
 use crate::tasks::AnySessionTask;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
@@ -109,6 +110,7 @@ pub(crate) struct TurnState {
     mailbox_delivery_phase: MailboxDeliveryPhase,
     granted_permissions: Option<AdditionalPermissionProfile>,
     strict_auto_review_enabled: bool,
+    strict_delegation_state: StrictDelegationState,
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
@@ -264,6 +266,14 @@ impl TurnState {
 
     pub(crate) fn strict_auto_review_enabled(&self) -> bool {
         self.strict_auto_review_enabled
+    }
+
+    pub(crate) fn strict_delegation_state(&self) -> &StrictDelegationState {
+        &self.strict_delegation_state
+    }
+
+    pub(crate) fn strict_delegation_state_mut(&mut self) -> &mut StrictDelegationState {
+        &mut self.strict_delegation_state
     }
 }
 

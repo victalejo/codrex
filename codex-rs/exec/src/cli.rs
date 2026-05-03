@@ -55,6 +55,10 @@ pub struct Cli {
     )]
     pub json: bool,
 
+    /// Require file edits to come from a completed delegate_to_minimax patch candidate.
+    #[arg(long = "strict-delegation", global = true, default_value_t = false)]
+    pub strict_delegation: bool,
+
     /// Specifies file where the last message from the agent should be written.
     #[arg(
         long = "output-last-message",

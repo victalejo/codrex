@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
+use crate::function_tool::FunctionCallError;
 use crate::session::tests::make_session_and_context;
 use crate::tools::context::ToolInvocation;
 use crate::tools::hook_names::HookToolName;
@@ -74,6 +75,27 @@ async fn pre_tool_use_payload_uses_freeform_patch_input() {
         Some(PreToolUsePayload {
             tool_name: HookToolName::apply_patch(),
             tool_input: json!({ "command": patch }),
+        })
+    );
+}
+
+#[tokio::test]
+async fn pre_tool_use_payload_redacts_sensitive_patch_input() {
+    let patch = r#"*** Begin Patch
+*** Add File: .env
++OPENAI_API_KEY=sk-test-secret-should-not-leak
+*** End Patch"#;
+    let payload = ToolPayload::Custom {
+        input: patch.to_string(),
+    };
+    let invocation = invocation_for_payload(payload).await;
+    let handler = ApplyPatchHandler;
+
+    assert_eq!(
+        handler.pre_tool_use_payload(&invocation),
+        Some(PreToolUsePayload {
+            tool_name: HookToolName::apply_patch(),
+            tool_input: json!({ "command": "[REDACTED_SENSITIVE_PATCH]" }),
         })
     );
 }
@@ -196,6 +218,26 @@ fn diff_consumer_sends_next_update_after_buffer_interval() {
     );
 }
 
+#[test]
+fn diff_consumer_does_not_stream_sensitive_patch_changes() {
+    let mut consumer = ApplyPatchArgumentDiffConsumer::default();
+
+    assert!(
+        consumer
+            .push_delta("call-1".to_string(), "*** Begin Patch\n")
+            .is_none()
+    );
+    assert!(
+        consumer
+            .push_delta(
+                "call-1".to_string(),
+                "*** Add File: .env\n+OPENAI_API_KEY=sk-test-secret-should-not-leak"
+            )
+            .is_none()
+    );
+    assert!(consumer.flush_update_on_complete().is_none());
+}
+
 #[tokio::test]
 async fn approval_keys_include_move_destination() {
     let tmp = TempDir::new().expect("tmp");
@@ -277,4 +319,141 @@ fn write_permissions_for_paths_keep_dirs_outside_workspace_root() {
             .and_then(|(_read, write)| write),
         Some(vec![expected_outside])
     );
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_sensitive_paths_before_runtime() {
+    let tmp = TempDir::new().expect("tmp");
+    let cwd = tmp.path().abs();
+    let patch = r#"*** Begin Patch
+*** Add File: .env
++OPENAI_API_KEY=sk-test-secret-should-not-leak
+*** End Patch"#;
+    let argv = vec!["apply_patch".to_string(), patch.to_string()];
+    let action = match codex_apply_patch::maybe_parse_apply_patch_verified(
+        &argv,
+        &cwd,
+        LOCAL_FS.as_ref(),
+        /*sandbox*/ None,
+    )
+    .await
+    {
+        MaybeApplyPatchVerified::Body(action) => action,
+        other => panic!("expected verified apply_patch body, got {other:?}"),
+    };
+    let (_session, turn) = make_session_and_context().await;
+    let sandbox_policy = SandboxPolicy::new_read_only_policy();
+
+    let result = crate::apply_patch::apply_patch(
+        &turn,
+        &FileSystemSandboxPolicy::from(&sandbox_policy),
+        action,
+    )
+    .await;
+
+    match result {
+        crate::apply_patch::InternalApplyPatchInvocation::Output(Err(
+            FunctionCallError::RespondToModel(message),
+        )) => {
+            assert_eq!(message, "blocked: patch modifies sensitive path .env.");
+            assert!(!message.contains("sk-test-secret-should-not-leak"));
+        }
+        _ => panic!("expected sensitive patch rejection"),
+    }
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_env_example_paths_before_runtime() {
+    let tmp = TempDir::new().expect("tmp");
+    let cwd = tmp.path().abs();
+    let patch = r#"*** Begin Patch
+*** Add File: .env.example
++OPENAI_API_KEY=sk-test-secret-should-not-leak
+*** End Patch"#;
+    let argv = vec!["apply_patch".to_string(), patch.to_string()];
+    let action = match codex_apply_patch::maybe_parse_apply_patch_verified(
+        &argv,
+        &cwd,
+        LOCAL_FS.as_ref(),
+        /*sandbox*/ None,
+    )
+    .await
+    {
+        MaybeApplyPatchVerified::Body(action) => action,
+        other => panic!("expected verified apply_patch body, got {other:?}"),
+    };
+    let (_session, turn) = make_session_and_context().await;
+    let sandbox_policy = SandboxPolicy::new_read_only_policy();
+
+    let result = crate::apply_patch::apply_patch(
+        &turn,
+        &FileSystemSandboxPolicy::from(&sandbox_policy),
+        action,
+    )
+    .await;
+
+    match result {
+        crate::apply_patch::InternalApplyPatchInvocation::Output(Err(
+            FunctionCallError::RespondToModel(message),
+        )) => {
+            assert_eq!(
+                message,
+                "blocked: patch modifies sensitive path .env.example."
+            );
+            assert!(!message.contains("sk-test-secret-should-not-leak"));
+        }
+        _ => panic!("expected sensitive patch rejection"),
+    }
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_mixed_patch_without_leaking_sensitive_hunks() {
+    let tmp = TempDir::new().expect("tmp");
+    let cwd = tmp.path().abs();
+    std::fs::create_dir_all(tmp.path().join("src")).expect("create src dir");
+    std::fs::write(
+        tmp.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a - b }\n",
+    )
+    .expect("write source file");
+    let patch = r#"*** Begin Patch
+*** Update File: src/lib.rs
+@@
+-pub fn add(a: i32, b: i32) -> i32 { a - b }
++pub fn add(a: i32, b: i32) -> i32 { a + b }
+*** Add File: .env
++OPENAI_API_KEY=sk-test-secret-should-not-leak
+*** End Patch"#;
+    let argv = vec!["apply_patch".to_string(), patch.to_string()];
+    let action = match codex_apply_patch::maybe_parse_apply_patch_verified(
+        &argv,
+        &cwd,
+        LOCAL_FS.as_ref(),
+        /*sandbox*/ None,
+    )
+    .await
+    {
+        MaybeApplyPatchVerified::Body(action) => action,
+        other => panic!("expected verified apply_patch body, got {other:?}"),
+    };
+    let (_session, turn) = make_session_and_context().await;
+    let sandbox_policy = SandboxPolicy::new_read_only_policy();
+
+    let result = crate::apply_patch::apply_patch(
+        &turn,
+        &FileSystemSandboxPolicy::from(&sandbox_policy),
+        action,
+    )
+    .await;
+
+    match result {
+        crate::apply_patch::InternalApplyPatchInvocation::Output(Err(
+            FunctionCallError::RespondToModel(message),
+        )) => {
+            assert_eq!(message, "blocked: patch modifies sensitive path .env.");
+            assert!(!message.contains("sk-test-secret-should-not-leak"));
+            assert!(!message.contains("src/lib.rs"));
+        }
+        _ => panic!("expected sensitive patch rejection"),
+    }
 }

@@ -16,6 +16,7 @@ use crate::exec_env::create_env;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::sandboxing::ExecRequest;
 use crate::sandboxing::ExecServerEnvConfig;
+use crate::sensitive_output::sanitize_utf8_lossy_bytes;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
@@ -318,6 +319,7 @@ impl UnifiedExecProcessManager {
         .await;
         let wall_time = Instant::now().saturating_duration_since(start);
 
+        let collected = sanitize_utf8_lossy_bytes(&collected);
         let text = String::from_utf8_lossy(&collected).to_string();
         let chunk_id = generate_chunk_id();
         if let Some(message) = process.failure_message() {
@@ -475,6 +477,7 @@ impl UnifiedExecProcessManager {
         .await;
         let wall_time = Instant::now().saturating_duration_since(start);
 
+        let collected = sanitize_utf8_lossy_bytes(&collected);
         let text = String::from_utf8_lossy(&collected).to_string();
         let original_token_count = approx_token_count(&text);
         let chunk_id = generate_chunk_id();

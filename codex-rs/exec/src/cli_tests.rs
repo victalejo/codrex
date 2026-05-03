@@ -2,6 +2,14 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn strict_delegation_flag_parses() {
+    let cli = Cli::parse_from(["codex-exec", "--strict-delegation", "summarize"]);
+
+    assert!(cli.strict_delegation);
+    assert_eq!(cli.prompt.as_deref(), Some("summarize"));
+}
+
+#[test]
 fn resume_parses_prompt_after_global_flags() {
     const PROMPT: &str = "echo resume-with-global-flags-after-subcommand";
     let cli = Cli::parse_from([

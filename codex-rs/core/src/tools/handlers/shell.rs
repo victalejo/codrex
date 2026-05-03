@@ -10,6 +10,7 @@ use crate::exec_env::create_env;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
+use crate::sensitive_output::sensitive_command_block;
 use crate::session::turn_context::TurnContext;
 use crate::shell::Shell;
 use crate::tools::context::FunctionToolOutput;
@@ -496,6 +497,10 @@ impl ShellHandler {
         .await?
         {
             return Ok(output);
+        }
+
+        if let Some(blocked) = sensitive_command_block(&exec_params.command) {
+            return Err(FunctionCallError::RespondToModel(blocked.message));
         }
 
         let source = ExecCommandSource::Agent;

@@ -1,6 +1,8 @@
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
 use crate::sandboxing::SandboxPermissions;
+use crate::sensitive_output::sensitive_command_block;
+use crate::sensitive_output::sensitive_command_block_from_text;
 use crate::shell::Shell;
 use crate::shell::get_shell_by_model_provided_path;
 use crate::tools::context::ExecCommandToolOutput;
@@ -330,6 +332,11 @@ impl ToolHandler for UnifiedExecHandler {
                     });
                 }
 
+                if let Some(blocked) = sensitive_command_block(&command) {
+                    manager.release_process_id(process_id).await;
+                    return Err(FunctionCallError::RespondToModel(blocked.message));
+                }
+
                 emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
                 match manager
                     .exec_command(
@@ -381,6 +388,9 @@ impl ToolHandler for UnifiedExecHandler {
             }
             "write_stdin" => {
                 let args: WriteStdinArgs = parse_arguments(&arguments)?;
+                if let Some(blocked) = sensitive_command_block_from_text(args.chars.as_str()) {
+                    return Err(FunctionCallError::RespondToModel(blocked.message));
+                }
                 let max_output_tokens =
                     effective_max_output_tokens(args.max_output_tokens, turn.truncation_policy);
                 let response = manager

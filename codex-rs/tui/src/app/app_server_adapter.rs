@@ -296,24 +296,18 @@ impl App {
         request_id: codex_app_server_protocol::RequestId,
         params: codex_app_server_protocol::DynamicToolCallParams,
     ) -> std::result::Result<(), String> {
-        if params.tool != crate::legacy_core::DELEGATE_TO_MINIMAX_TOOL_NAME {
-            let reason = format!("Unsupported dynamic tool `{}`.", params.tool);
-            self.chat_widget.add_error_message(reason.clone());
-            return self
-                .reject_app_server_request(app_server_client, request_id, reason)
-                .await;
-        }
-
         let thread_id = match ThreadId::from_string(&params.thread_id) {
             Ok(thread_id) => thread_id,
             Err(err) => {
-                return self
-                    .reject_app_server_request(
-                        app_server_client,
-                        request_id,
-                        format!("invalid thread id for dynamic tool call: {err}"),
-                    )
-                    .await;
+                let response = dynamic_tool_failure_response(format!(
+                    "invalid thread id for dynamic tool call: {err}"
+                ));
+                return resolve_dynamic_tool_call_request(
+                    app_server_client.request_handle(),
+                    request_id,
+                    response,
+                )
+                .await;
             }
         };
         let cwd = if self.primary_thread_id == Some(thread_id) {
@@ -329,48 +323,19 @@ impl App {
         } else {
             self.thread_cwd(thread_id).await
         };
-
-        let request = serde_json::from_value::<crate::legacy_core::DelegateToMinimaxRequest>(
-            params.arguments,
-        )
-        .map_err(|err| format!("delegate_to_minimax received invalid arguments: {err}"));
         let request_handle = app_server_client.request_handle();
-        let thread_id_text = params.thread_id;
         let codex_home = self.chat_widget.config_ref().codex_home.clone();
         tokio::spawn(async move {
-            let response = match (cwd, request) {
-                (Some(cwd), Ok(request)) => {
-                    match crate::legacy_core::delegate_to_minimax(
-                        request,
-                        cwd.as_path(),
-                        codex_home.as_path(),
-                    )
-                    .await
-                    {
-                        Ok(response) => delegate_dynamic_tool_response(response),
-                        Err(err) => dynamic_tool_failure_response(format!(
-                            "MiniMax delegation failed: {err}"
-                        )),
-                    }
-                }
-                (Some(_), Err(err)) => dynamic_tool_failure_response(err),
-                (None, _) => dynamic_tool_failure_response(format!(
-                    "delegate_to_minimax could not resolve a working directory for thread {thread_id_text}"
-                )),
-            };
-
-            match serde_json::to_value(response) {
-                Ok(result) => {
-                    if let Err(err) = request_handle
-                        .resolve_server_request(request_id, result)
-                        .await
-                    {
-                        tracing::warn!("failed to resolve dynamic tool request: {err}");
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!("failed to serialize dynamic tool response: {err}");
-                }
+            let response = codex_app_server_client::execute_dynamic_tool_call(
+                params,
+                cwd.as_deref(),
+                codex_home.as_path(),
+            )
+            .await;
+            if let Err(err) =
+                resolve_dynamic_tool_call_request(request_handle, request_id, response).await
+            {
+                tracing::warn!("{err}");
             }
         });
         Ok(())
@@ -395,40 +360,30 @@ impl App {
     }
 }
 
+#[cfg(test)]
 fn delegate_dynamic_tool_response(
     response: crate::legacy_core::DelegateToMinimaxResponse,
 ) -> codex_app_server_protocol::DynamicToolCallResponse {
-    codex_app_server_protocol::DynamicToolCallResponse {
-        content_items: dynamic_tool_content_items(response),
-        success: true,
-    }
+    codex_app_server_client::delegate_dynamic_tool_response(response)
 }
 
 fn dynamic_tool_failure_response(
     message: String,
 ) -> codex_app_server_protocol::DynamicToolCallResponse {
-    codex_app_server_protocol::DynamicToolCallResponse {
-        content_items: vec![
-            codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
-                text: message,
-            },
-        ],
-        success: false,
-    }
+    codex_app_server_client::dynamic_tool_failure_response(message)
 }
 
-fn dynamic_tool_content_items(
-    response: crate::legacy_core::DelegateToMinimaxResponse,
-) -> Vec<codex_app_server_protocol::DynamicToolCallOutputContentItem> {
-    let text = serde_json::to_string(&response).unwrap_or_else(|err| {
-        serde_json::json!({
-            "status": "invalid",
-            "error": format!("failed to serialize delegate_to_minimax response: {err}"),
-        })
-        .to_string()
-    });
-
-    vec![codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text }]
+async fn resolve_dynamic_tool_call_request(
+    request_handle: codex_app_server_client::AppServerRequestHandle,
+    request_id: codex_app_server_protocol::RequestId,
+    response: codex_app_server_protocol::DynamicToolCallResponse,
+) -> std::result::Result<(), String> {
+    let result = serde_json::to_value(response)
+        .map_err(|err| format!("failed to serialize dynamic tool response: {err}"))?;
+    request_handle
+        .resolve_server_request(request_id, result)
+        .await
+        .map_err(|err| format!("failed to resolve dynamic tool request: {err}"))
 }
 
 fn server_request_thread_id(request: &ServerRequest) -> Option<ThreadId> {

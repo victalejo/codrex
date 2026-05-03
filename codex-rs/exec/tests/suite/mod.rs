@@ -2,6 +2,7 @@
 mod add_dir;
 mod apply_patch;
 mod auth_env;
+mod delegate_to_minimax;
 mod ephemeral;
 mod mcp_required_exit;
 mod originator;
@@ -10,3 +11,4 @@ mod prompt_stdin;
 mod resume;
 mod sandbox;
 mod server_error_exit;
+mod strict_delegation;

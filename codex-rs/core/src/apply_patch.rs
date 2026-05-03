@@ -1,6 +1,8 @@
 use crate::function_tool::FunctionCallError;
 use crate::safety::SafetyCheck;
 use crate::safety::assess_patch_safety;
+use crate::sensitive_output::first_sensitive_path;
+use crate::sensitive_output::sensitive_patch_block_message;
 use crate::session::turn_context::TurnContext;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use codex_apply_patch::ApplyPatchAction;
@@ -35,6 +37,24 @@ pub(crate) async fn apply_patch(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     action: ApplyPatchAction,
 ) -> InternalApplyPatchInvocation {
+    if let Some(path) = first_sensitive_path(action.changes().iter().flat_map(|(path, change)| {
+        std::iter::once(path.as_path()).chain(match change {
+            ApplyPatchFileChange::Update {
+                move_path: Some(move_path),
+                ..
+            } => Some(move_path.as_path()).into_iter(),
+            ApplyPatchFileChange::Add { .. }
+            | ApplyPatchFileChange::Delete { .. }
+            | ApplyPatchFileChange::Update {
+                move_path: None, ..
+            } => None.into_iter(),
+        })
+    })) {
+        return InternalApplyPatchInvocation::Output(Err(FunctionCallError::RespondToModel(
+            sensitive_patch_block_message(path.as_str()),
+        )));
+    }
+
     match assess_patch_safety(
         &action,
         turn_context.approval_policy.value(),

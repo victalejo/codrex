@@ -412,7 +412,7 @@ async fn thread_start_params_include_review_policy_when_review_policy_is_manual_
         .await
         .expect("build config with manual-only review policy");
 
-    let params = thread_start_params_from_config(&config);
+    let params = thread_start_params_from_config(&config, /*strict_delegation*/ false);
 
     assert_eq!(
         params.approvals_reviewer,
@@ -440,7 +440,7 @@ async fn thread_start_params_include_review_policy_when_auto_review_is_enabled()
         .await
         .expect("build config with guardian review policy");
 
-    let params = thread_start_params_from_config(&config);
+    let params = thread_start_params_from_config(&config, /*strict_delegation*/ false);
 
     assert_eq!(
         params.approvals_reviewer,
@@ -460,7 +460,7 @@ async fn thread_start_params_include_delegate_tool_when_minimax_credentials_exis
         .await
         .expect("build config with minimax credentials");
 
-    let params = thread_start_params_from_config(&config);
+    let params = thread_start_params_from_config(&config, /*strict_delegation*/ false);
     let dynamic_tools = params
         .dynamic_tools
         .expect("delegate_to_minimax should be registered");
@@ -504,6 +504,100 @@ fn thread_start_params_omit_delegate_tool_without_minimax_credentials() {
     let codex_home = tempdir().expect("create temp codex home");
 
     assert_eq!(delegate_dynamic_tools(codex_home.path()), None);
+}
+
+#[tokio::test]
+async fn thread_start_params_include_strict_delegation_instructions_when_enabled() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            developer_instructions: Some("Stay inside the repo.".to_string()),
+            ..Default::default()
+        })
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config with developer instructions");
+
+    let params = thread_start_params_from_config(&config, /*strict_delegation*/ true);
+    let developer_instructions = params
+        .developer_instructions
+        .expect("strict delegation should inject developer instructions");
+
+    assert!(developer_instructions.contains("Stay inside the repo."));
+    assert!(developer_instructions.contains(STRICT_DELEGATION_MARKER));
+    assert!(developer_instructions.contains("Strict delegation mode is active"));
+}
+
+#[tokio::test]
+async fn exec_dynamic_tool_call_response_reports_unregistered_tool() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let context = ExecDynamicToolContext {
+        available_tools: std::collections::HashSet::new(),
+        cwd: temp_dir.path().to_path_buf(),
+        codex_home: temp_dir.path().to_path_buf(),
+    };
+
+    let response = exec_dynamic_tool_call_response(
+        codex_app_server_protocol::DynamicToolCallParams {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            call_id: "call-1".to_string(),
+            namespace: None,
+            tool: "unknown_dynamic_tool".to_string(),
+            arguments: serde_json::json!({}),
+        },
+        &context,
+    )
+    .await;
+
+    assert_eq!(response.success, false);
+    assert_eq!(
+        response.content_items,
+        vec![
+            codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
+                text:
+                    "dynamic tool `unknown_dynamic_tool` is not registered for this exec session."
+                        .to_string(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn exec_dynamic_tool_call_response_reports_invalid_arguments() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let context = ExecDynamicToolContext {
+        available_tools: std::collections::HashSet::from([
+            codex_core::DELEGATE_TO_MINIMAX_TOOL_NAME.to_string(),
+        ]),
+        cwd: temp_dir.path().to_path_buf(),
+        codex_home: temp_dir.path().to_path_buf(),
+    };
+
+    let response = exec_dynamic_tool_call_response(
+        codex_app_server_protocol::DynamicToolCallParams {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            call_id: "call-1".to_string(),
+            namespace: None,
+            tool: codex_core::DELEGATE_TO_MINIMAX_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({}),
+        },
+        &context,
+    )
+    .await;
+
+    assert_eq!(response.success, false);
+    assert_eq!(response.content_items.len(), 1);
+    let [codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text }] =
+        response.content_items.as_slice()
+    else {
+        panic!("expected single text output item");
+    };
+    assert!(text.starts_with("delegate_to_minimax received invalid arguments:"));
 }
 
 #[test]

@@ -2,6 +2,8 @@ use super::MiniMaxContextFileSource;
 use super::git_status::GitStatusCandidate;
 use super::git_status::MAX_GIT_CONTEXT_FILES;
 use super::git_status::collect_git_status_candidates;
+use crate::sensitive_output::is_sensitive_path;
+use crate::sensitive_output::sanitize_output_text;
 use codex_git_utils::get_git_repo_root;
 use regex_lite::Regex;
 use std::collections::HashSet;
@@ -516,7 +518,8 @@ fn add_context_entry(
         return false;
     }
 
-    let (redacted_content, redacted) = redact_secrets(content.as_str());
+    let redacted_content = sanitize_output_text(content.as_str());
+    let redacted = redacted_content.changed;
     if redacted {
         push_diag(
             &mut pack.diagnostics.messages,
@@ -525,10 +528,10 @@ fn add_context_entry(
     }
 
     let per_file_content = codex_utils_string::take_bytes_at_char_boundary(
-        redacted_content.as_str(),
+        redacted_content.text.as_str(),
         per_file_budget_bytes,
     );
-    let mut truncated = per_file_content.len() < redacted_content.len();
+    let mut truncated = per_file_content.len() < redacted_content.text.len();
     if truncated {
         push_diag(
             &mut pack.diagnostics.messages,
@@ -616,74 +619,7 @@ fn is_path_traversal(path: &Path) -> bool {
 }
 
 fn is_denied_path(path: &Path) -> bool {
-    path.components().any(|component| match component {
-        Component::Normal(value) => {
-            let component = value.to_string_lossy().to_lowercase();
-            matches!(
-                component.as_str(),
-                ".git" | "target" | "node_modules" | "vendor"
-            ) || component == ".env"
-                || component.starts_with(".env.")
-                || component == "auth.json"
-                || component.contains("credentials")
-                || component == "id_rsa"
-                || component == "id_ed25519"
-                || component.ends_with(".pem")
-                || component.ends_with(".key")
-                || component.contains("private_key")
-                || component.contains("private-key")
-        }
-        _ => false,
-    })
-}
-
-fn redact_secrets(content: &str) -> (String, bool) {
-    let mut redacted = false;
-    let mut updated = content.to_string();
-
-    for (regex, replacement) in redaction_patterns() {
-        let next = regex
-            .replace_all(updated.as_str(), *replacement)
-            .into_owned();
-        if next != updated {
-            redacted = true;
-            updated = next;
-        }
-    }
-
-    (updated, redacted)
-}
-
-fn redaction_patterns() -> &'static [(Regex, &'static str)] {
-    static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        vec![
-            (
-                compile_regex(r"(Authorization:\s*Bearer\s+)[A-Za-z0-9._-]+"),
-                "${1}[REDACTED]",
-            ),
-            (
-                compile_regex(r#"\b(MINIMAX_API_KEY|OPENAI_API_KEY)\s*=\s*[^\s"']+"#),
-                "$1=[REDACTED]",
-            ),
-            (
-                compile_regex(
-                    r#"(\bapi[_-]?key\b\s*[:=]\s*)(?:"[^"]{8,}"|'[^']{8,}'|[A-Za-z0-9._-]{8,})"#,
-                ),
-                "${1}[REDACTED]",
-            ),
-            (
-                compile_regex(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
-                "[REDACTED]",
-            ),
-            (
-                compile_regex(
-                    r#"(\b(?:token|secret|access_token|refresh_token)\b\s*[:=]\s*)(?:"[^"]{8,}"|'[^']{8,}'|[A-Za-z0-9._-]{16,})"#,
-                ),
-                "${1}[REDACTED]",
-            ),
-        ]
-    })
+    is_sensitive_path(path)
 }
 
 fn compile_regex(pattern: &str) -> Regex {
@@ -948,7 +884,7 @@ mod tests {
         assert_eq!(pack.files.len(), 1);
         assert!(!pack.files[0].content.contains("sk-secret-12345678"));
         assert!(!pack.files[0].content.contains("tokenvalue"));
-        assert!(pack.files[0].content.contains("[REDACTED]"));
+        assert!(pack.files[0].content.contains("[REDACTED_SECRET]"));
         assert_eq!(
             pack.diagnostics.messages,
             vec!["redacted potential secret in config.txt".to_string()]

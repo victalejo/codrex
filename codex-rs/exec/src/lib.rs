@@ -130,6 +130,7 @@ pub use exec_events::Usage;
 pub use exec_events::WebSearchItem;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::io::Read;
 use std::path::Path;
@@ -150,6 +151,15 @@ use crate::cli::Command as ExecCommand;
 use crate::event_processor::EventProcessor;
 
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
+const STRICT_DELEGATION_MARKER: &str = "<strict_delegation mode=\"required\" />";
+const STRICT_DELEGATION_DEVELOPER_INSTRUCTIONS: &str = r#"Strict delegation mode is active for this exec session.
+
+- Do not edit files manually.
+- Do not use shell commands to modify files and bypass strict delegation.
+- If `delegate_to_minimax` returns `status="completed"` with `format="apply_patch"`, review `context_summary`, `diagnostics`, and the patch, then only apply that exact patch candidate with `apply_patch`.
+- If `delegate_to_minimax` returns `status="invalid"`, you may retry with stricter instructions or better context, but do not invent and apply your own patch.
+- If `delegate_to_minimax` returns `status="clarify"`, ask the user the question or end with the question. Do not apply a patch.
+- If MiniMax delegation fails, report the failure. Do not fall back to a manual fix."#;
 
 enum InitialOperation {
     UserTurn {
@@ -204,6 +214,13 @@ struct ExecRunArgs {
     prompt: Option<String>,
     skip_git_repo_check: bool,
     stderr_with_ansi: bool,
+    strict_delegation: bool,
+}
+
+struct ExecDynamicToolContext {
+    available_tools: HashSet<String>,
+    cwd: PathBuf,
+    codex_home: PathBuf,
 }
 
 fn exec_root_span() -> tracing::Span {
@@ -230,6 +247,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         color,
         last_message_file,
         json: json_mode,
+        strict_delegation,
         prompt,
         output_schema: output_schema_path,
         config_overrides,
@@ -534,6 +552,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         prompt,
         skip_git_repo_check,
         stderr_with_ansi,
+        strict_delegation,
     })
     .instrument(exec_span)
     .await
@@ -555,6 +574,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         prompt,
         skip_git_repo_check,
         stderr_with_ansi,
+        strict_delegation,
     } = args;
 
     let mut event_processor: Box<dyn EventProcessor> = match json_mode {
@@ -665,43 +685,29 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     // Handle resume subcommand through existing `thread/list` + `thread/resume`
     // APIs so exec no longer reaches into rollout storage directly.
-    let (primary_thread_id, fallback_session_configured) =
-        if let Some(ExecCommand::Resume(args)) = command.as_ref() {
-            if let Some(thread_id) = resolve_resume_thread_id(&client, &config, args).await? {
-                let response: ThreadResumeResponse = send_request_with_response(
-                    &client,
-                    ClientRequest::ThreadResume {
-                        request_id: request_ids.next(),
-                        params: thread_resume_params_from_config(&config, thread_id),
-                    },
-                    "thread/resume",
-                )
-                .await
+    let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
+        command.as_ref()
+    {
+        if let Some(thread_id) = resolve_resume_thread_id(&client, &config, args).await? {
+            let response: ThreadResumeResponse = send_request_with_response(
+                &client,
+                ClientRequest::ThreadResume {
+                    request_id: request_ids.next(),
+                    params: thread_resume_params_from_config(&config, thread_id, strict_delegation),
+                },
+                "thread/resume",
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            let session_configured = session_configured_from_thread_resume_response(&response)
                 .map_err(anyhow::Error::msg)?;
-                let session_configured = session_configured_from_thread_resume_response(&response)
-                    .map_err(anyhow::Error::msg)?;
-                (session_configured.session_id, session_configured)
-            } else {
-                let response: ThreadStartResponse = send_request_with_response(
-                    &client,
-                    ClientRequest::ThreadStart {
-                        request_id: request_ids.next(),
-                        params: thread_start_params_from_config(&config),
-                    },
-                    "thread/start",
-                )
-                .await
-                .map_err(anyhow::Error::msg)?;
-                let session_configured = session_configured_from_thread_start_response(&response)
-                    .map_err(anyhow::Error::msg)?;
-                (session_configured.session_id, session_configured)
-            }
+            (session_configured.session_id, session_configured)
         } else {
             let response: ThreadStartResponse = send_request_with_response(
                 &client,
                 ClientRequest::ThreadStart {
                     request_id: request_ids.next(),
-                    params: thread_start_params_from_config(&config),
+                    params: thread_start_params_from_config(&config, strict_delegation),
                 },
                 "thread/start",
             )
@@ -710,13 +716,37 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             let session_configured = session_configured_from_thread_start_response(&response)
                 .map_err(anyhow::Error::msg)?;
             (session_configured.session_id, session_configured)
-        };
+        }
+    } else {
+        let response: ThreadStartResponse = send_request_with_response(
+            &client,
+            ClientRequest::ThreadStart {
+                request_id: request_ids.next(),
+                params: thread_start_params_from_config(&config, strict_delegation),
+            },
+            "thread/start",
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let session_configured =
+            session_configured_from_thread_start_response(&response).map_err(anyhow::Error::msg)?;
+        (session_configured.session_id, session_configured)
+    };
 
     let primary_thread_id_for_span = primary_thread_id.to_string();
     // Use the start/resume response as the authoritative bootstrap payload.
     // Waiting for a later streamed `SessionConfigured` event adds up to 10s of
     // avoidable startup latency on the in-process path.
     let session_configured = fallback_session_configured;
+    let dynamic_tool_context = ExecDynamicToolContext {
+        available_tools: delegate_dynamic_tools(config.codex_home.as_path())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect(),
+        cwd: session_configured.cwd.to_path_buf(),
+        codex_home: config.codex_home.to_path_buf(),
+    };
 
     exec_span.record("thread.id", primary_thread_id_for_span.as_str());
 
@@ -844,7 +874,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
         match server_event {
             InProcessServerEvent::ServerRequest(request) => {
-                handle_server_request(&client, request, &mut error_seen).await;
+                handle_server_request(&client, request, &dynamic_tool_context, &mut error_seen)
+                    .await;
             }
             InProcessServerEvent::ServerNotification(mut notification) => {
                 if let ServerNotification::Error(payload) = &notification {
@@ -915,7 +946,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
+fn thread_start_params_from_config(config: &Config, strict_delegation: bool) -> ThreadStartParams {
     let dynamic_tools = delegate_dynamic_tools(config.codex_home.as_path());
 
     ThreadStartParams {
@@ -927,6 +958,8 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
         sandbox: None,
         permission_profile: Some(config.permissions.permission_profile().into()),
         config: config_request_overrides_from_config(config),
+        developer_instructions: strict_delegation
+            .then(|| strict_delegation_developer_instructions(config)),
         dynamic_tools,
         ephemeral: Some(config.ephemeral),
         ..ThreadStartParams::default()
@@ -948,7 +981,11 @@ fn delegate_dynamic_tools(
     })
 }
 
-fn thread_resume_params_from_config(config: &Config, thread_id: String) -> ThreadResumeParams {
+fn thread_resume_params_from_config(
+    config: &Config,
+    thread_id: String,
+    strict_delegation: bool,
+) -> ThreadResumeParams {
     ThreadResumeParams {
         thread_id,
         model: config.model.clone(),
@@ -959,8 +996,23 @@ fn thread_resume_params_from_config(config: &Config, thread_id: String) -> Threa
         sandbox: None,
         permission_profile: Some(config.permissions.permission_profile().into()),
         config: config_request_overrides_from_config(config),
+        developer_instructions: strict_delegation
+            .then(|| strict_delegation_developer_instructions(config)),
         ..ThreadResumeParams::default()
     }
+}
+
+fn strict_delegation_developer_instructions(config: &Config) -> String {
+    let mut sections = Vec::new();
+    if let Some(existing) = config.developer_instructions.as_deref()
+        && !existing.is_empty()
+    {
+        sections.push(existing.to_string());
+    }
+    sections.push(format!(
+        "{STRICT_DELEGATION_MARKER}\n{STRICT_DELEGATION_DEVELOPER_INSTRUCTIONS}"
+    ));
+    sections.join("\n\n")
 }
 
 fn config_request_overrides_from_config(config: &Config) -> Option<HashMap<String, Value>> {
@@ -1446,6 +1498,7 @@ fn server_request_method_name(request: &ServerRequest) -> String {
 async fn handle_server_request(
     client: &InProcessAppServerClient,
     request: ServerRequest,
+    dynamic_tool_context: &ExecDynamicToolContext,
     error_seen: &mut bool,
 ) {
     let method = server_request_method_name(&request);
@@ -1504,16 +1557,8 @@ async fn handle_server_request(
             .await
         }
         ServerRequest::DynamicToolCall { request_id, params } => {
-            reject_server_request(
-                client,
-                request_id,
-                &method,
-                format!(
-                    "dynamic tool calls are not supported in exec mode for thread `{}`",
-                    params.thread_id
-                ),
-            )
-            .await
+            let response = exec_dynamic_tool_call_response(params, dynamic_tool_context).await;
+            resolve_dynamic_tool_call_response(client, request_id, response, &method).await
         }
         ServerRequest::ChatgptAuthTokensRefresh { request_id, .. } => {
             reject_server_request(
@@ -1566,6 +1611,36 @@ async fn handle_server_request(
         *error_seen = true;
         warn!("{err}");
     }
+}
+
+async fn resolve_dynamic_tool_call_response(
+    client: &InProcessAppServerClient,
+    request_id: RequestId,
+    response: codex_app_server_protocol::DynamicToolCallResponse,
+    method: &str,
+) -> Result<(), String> {
+    let value = serde_json::to_value(response)
+        .map_err(|err| format!("failed to serialize `{method}` server request response: {err}"))?;
+    resolve_server_request(client, request_id, value, method).await
+}
+
+async fn exec_dynamic_tool_call_response(
+    params: codex_app_server_protocol::DynamicToolCallParams,
+    dynamic_tool_context: &ExecDynamicToolContext,
+) -> codex_app_server_protocol::DynamicToolCallResponse {
+    if !dynamic_tool_context.available_tools.contains(&params.tool) {
+        return codex_app_server_client::dynamic_tool_failure_response(format!(
+            "dynamic tool `{}` is not registered for this exec session.",
+            params.tool
+        ));
+    }
+
+    codex_app_server_client::execute_dynamic_tool_call(
+        params,
+        Some(dynamic_tool_context.cwd.as_path()),
+        dynamic_tool_context.codex_home.as_path(),
+    )
+    .await
 }
 
 fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {

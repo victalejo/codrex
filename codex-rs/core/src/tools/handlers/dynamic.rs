@@ -111,6 +111,11 @@ async fn request_dynamic_tool(
     });
     session.send_event(turn_context, event).await;
     let response = rx_response.await.ok();
+    if let Some(response) = response.as_ref() {
+        session
+            .record_strict_delegation_response_for_turn(turn_context, tool.as_str(), response)
+            .await;
+    }
 
     let response_event = match &response {
         Some(response) => EventMsg::DynamicToolCallResponse(DynamicToolCallResponseEvent {

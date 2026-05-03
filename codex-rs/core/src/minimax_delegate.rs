@@ -64,7 +64,9 @@ WORKFLOW:
    - If `status=completed`: review the patch before applying it, then apply it yourself with the normal Codex tools only if it looks correct
    - If `status=clarify`: do not apply anything; ask the user or gather the missing file/context, then retry only after you have new information
    - If `status=invalid`: do not apply anything; if the error is invalid format you may retry once with stricter instructions, and if the error is insufficient context you should attach the relevant files before retrying
+   - Do not read, diff, cat, print, or otherwise expose sensitive files such as `.env`, `auth.json`, private keys, or credential files
    - If required files were omitted, attach them explicitly on retry; if sensitive files were denied, do not try to force them into MiniMax
+   - If a command was blocked for a sensitive path, do not try to evade the guardrail with another command; rely on `context_summary`/`diagnostics` or ask the user for abstract guidance
    - Avoid indefinite retry loops; if one retry does not fix the issue, either gather better context or do the work yourself
 
 The user may see the worker output in tool history. You are responsible for evaluating quality before applying it."#;
@@ -1133,6 +1135,7 @@ mod tests {
         assert!(prompt.contains("Avoid indefinite retry loops"));
         assert!(prompt.contains("include_modified_files"));
         assert!(prompt.contains("secrets, credentials, auth, tokens"));
+        assert!(prompt.contains("Do not read, diff, cat, print"));
     }
 
     #[test]

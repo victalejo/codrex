@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
 use crate::sandboxing::SandboxPermissions;
+use crate::sensitive_output::sanitize_exec_output;
+use crate::sensitive_output::sanitize_utf8_lossy_bytes;
 use crate::spawn::SpawnChildRequest;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
@@ -673,14 +675,14 @@ fn finalize_exec_result(
             let stdout = raw_output.stdout.from_utf8_lossy();
             let stderr = raw_output.stderr.from_utf8_lossy();
             let aggregated_output = raw_output.aggregated_output.from_utf8_lossy();
-            let exec_output = ExecToolCallOutput {
+            let exec_output = sanitize_exec_output(&ExecToolCallOutput {
                 exit_code,
                 stdout,
                 stderr,
                 aggregated_output,
                 duration,
                 timed_out,
-            };
+            });
 
             if timed_out {
                 return Err(CodexErr::Sandbox(SandboxErr::Timeout {
@@ -1351,23 +1353,25 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
         if let Some(stream) = &stream
             && emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
         {
-            let chunk = tmp[..n].to_vec();
-            let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
-                call_id: stream.call_id.clone(),
-                stream: if is_stderr {
-                    ExecOutputStream::Stderr
-                } else {
-                    ExecOutputStream::Stdout
-                },
-                chunk,
-            });
-            let event = Event {
-                id: stream.sub_id.clone(),
-                msg,
-            };
-            #[allow(clippy::let_unit_value)]
-            let _ = stream.tx_event.send(event).await;
-            emitted_deltas += 1;
+            let chunk = sanitize_utf8_lossy_bytes(&tmp[..n]);
+            if !chunk.is_empty() {
+                let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                    call_id: stream.call_id.clone(),
+                    stream: if is_stderr {
+                        ExecOutputStream::Stderr
+                    } else {
+                        ExecOutputStream::Stdout
+                    },
+                    chunk,
+                });
+                let event = Event {
+                    id: stream.sub_id.clone(),
+                    msg,
+                };
+                #[allow(clippy::let_unit_value)]
+                let _ = stream.tx_event.send(event).await;
+                emitted_deltas += 1;
+            }
         }
 
         if let Some(max_bytes) = max_bytes {

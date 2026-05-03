@@ -289,6 +289,8 @@ use crate::state::SessionState;
 use crate::stream_events_utils::HandleOutputCtx;
 #[cfg(test)]
 use crate::stream_events_utils::handle_output_item_done;
+use crate::strict_delegation::StrictDelegationViolation;
+use crate::strict_delegation::strict_delegation_enabled;
 use crate::tasks::GhostSnapshotTask;
 use crate::tasks::ReviewTask;
 use crate::tasks::SessionTask;
@@ -2275,6 +2277,55 @@ impl Session {
         };
         let ts = active.turn_state.lock().await;
         ts.strict_auto_review_enabled()
+    }
+
+    pub(crate) async fn record_strict_delegation_response_for_turn(
+        &self,
+        turn_context: &TurnContext,
+        tool_name: &str,
+        response: &DynamicToolResponse,
+    ) {
+        if !strict_delegation_enabled(turn_context.developer_instructions.as_deref()) {
+            return;
+        }
+
+        let turn_state = {
+            let active = self.active_turn.lock().await;
+            active.as_ref().map(|active| Arc::clone(&active.turn_state))
+        };
+        let Some(turn_state) = turn_state else {
+            return;
+        };
+        let mut ts = turn_state.lock().await;
+        ts.strict_delegation_state_mut()
+            .record_delegate_response(tool_name, response);
+    }
+
+    pub(crate) async fn strict_delegation_violation_for_patch(
+        &self,
+        turn_context: &TurnContext,
+        patch: &str,
+    ) -> Option<StrictDelegationViolation> {
+        if !strict_delegation_enabled(turn_context.developer_instructions.as_deref()) {
+            return None;
+        }
+
+        let turn_state = {
+            let active = self.active_turn.lock().await;
+            active.as_ref().map(|active| Arc::clone(&active.turn_state))
+        };
+        let Some(turn_state) = turn_state else {
+            return Some(StrictDelegationViolation {
+                reason:
+                    crate::strict_delegation::StrictDelegationViolationReason::NoCompletedCandidate,
+                has_completed_candidate: false,
+                candidate_count: 0,
+            });
+        };
+        let ts = turn_state.lock().await;
+        ts.strict_delegation_state()
+            .validate_apply_patch(patch)
+            .err()
     }
 
     pub(crate) async fn granted_session_permissions(&self) -> Option<AdditionalPermissionProfile> {

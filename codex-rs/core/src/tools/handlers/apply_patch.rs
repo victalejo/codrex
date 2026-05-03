@@ -10,8 +10,10 @@ use crate::apply_patch;
 use crate::apply_patch::InternalApplyPatchInvocation;
 use crate::apply_patch::convert_apply_patch_to_protocol;
 use crate::function_tool::FunctionCallError;
+use crate::sensitive_output::is_sensitive_path;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::strict_delegation::STRICT_DELEGATION_BLOCK_MESSAGE;
 use crate::tools::context::ApplyPatchToolOutput;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -94,6 +96,10 @@ impl ApplyPatchArgumentDiffConsumer {
         if self.last_progress.as_ref() == Some(&hunks) {
             return None;
         }
+        if hunks_include_sensitive_path(&hunks) {
+            self.last_progress = Some(hunks);
+            return None;
+        }
 
         let changes = convert_apply_patch_hunks_to_protocol(&hunks);
         self.last_progress = Some(hunks);
@@ -153,6 +159,20 @@ fn hunk_source_path(hunk: &Hunk) -> &Path {
             path
         }
     }
+}
+
+fn hunks_include_sensitive_path(hunks: &[Hunk]) -> bool {
+    hunks.iter().any(|hunk| match hunk {
+        Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => is_sensitive_path(path),
+        Hunk::UpdateFile {
+            path, move_path, ..
+        } => {
+            is_sensitive_path(path)
+                || move_path
+                    .as_ref()
+                    .is_some_and(|move_path| is_sensitive_path(move_path))
+        }
+    })
 }
 
 fn format_update_chunks_for_progress(chunks: &[codex_apply_patch::UpdateFileChunk]) -> String {
@@ -252,10 +272,20 @@ fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
     match payload {
         ToolPayload::Function { arguments } => parse_arguments::<ApplyPatchToolArgs>(arguments)
             .ok()
-            .map(|args| args.input),
-        ToolPayload::Custom { input } => Some(input.clone()),
+            .map(|args| sanitize_patch_hook_command(args.input)),
+        ToolPayload::Custom { input } => Some(sanitize_patch_hook_command(input.clone())),
         _ => None,
     }
+}
+
+fn sanitize_patch_hook_command(command: String) -> String {
+    let Ok(ApplyPatchArgs { hunks, .. }) = parse_patch_streaming(command.as_str()) else {
+        return command;
+    };
+    if hunks_include_sensitive_path(&hunks) {
+        return "[REDACTED_SENSITIVE_PATCH]".to_string();
+    }
+    command
 }
 
 async fn effective_patch_permissions(
@@ -290,6 +320,29 @@ async fn effective_patch_permissions(
         effective_additional_permissions,
         file_system_sandbox_policy,
     )
+}
+
+async fn enforce_strict_delegation_patch(
+    session: &Session,
+    turn: &TurnContext,
+    patch_input: &str,
+) -> Result<(), FunctionCallError> {
+    if let Some(violation) = session
+        .strict_delegation_violation_for_patch(turn, patch_input)
+        .await
+    {
+        tracing::warn!(
+            ?violation.reason,
+            has_completed_candidate = violation.has_completed_candidate,
+            candidate_count = violation.candidate_count,
+            "strict delegation blocked patch application"
+        );
+        return Err(FunctionCallError::RespondToModel(
+            STRICT_DELEGATION_BLOCK_MESSAGE.to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 impl ToolHandler for ApplyPatchHandler {
@@ -361,6 +414,8 @@ impl ToolHandler for ApplyPatchHandler {
                 ));
             }
         };
+
+        enforce_strict_delegation_patch(session.as_ref(), turn.as_ref(), &patch_input).await?;
 
         // Re-parse and verify the patch so we can compute changes and approval.
         // Avoid building temporary ExecParams/command vectors; derive directly from inputs.
@@ -476,6 +531,12 @@ pub(crate) async fn intercept_apply_patch(
     call_id: &str,
     tool_name: &str,
 ) -> Result<Option<FunctionToolOutput>, FunctionCallError> {
+    if let Some(patch_input) = command.get(1)
+        && command.first().is_some_and(|tool| tool == "apply_patch")
+    {
+        enforce_strict_delegation_patch(session.as_ref(), turn.as_ref(), patch_input).await?;
+    }
+
     let sandbox = turn
         .environment
         .as_ref()

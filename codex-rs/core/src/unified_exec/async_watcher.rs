@@ -9,6 +9,9 @@ use tokio::time::Sleep;
 use super::UnifiedExecContext;
 use super::process::UnifiedExecProcess;
 use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
+use crate::sensitive_output::sanitize_exec_output;
+use crate::sensitive_output::sanitize_output_text;
+use crate::sensitive_output::sanitize_utf8_lossy_bytes;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::events::ToolEmitter;
@@ -175,10 +178,14 @@ async fn process_chunk(
             continue;
         }
 
+        let chunk = sanitize_utf8_lossy_bytes(&prefix);
+        if chunk.is_empty() {
+            continue;
+        }
         let event = ExecCommandOutputDeltaEvent {
             call_id: call_id.to_string(),
             stream: ExecOutputStream::Stdout,
-            chunk: prefix,
+            chunk,
         };
         session_ref
             .send_event(turn_ref.as_ref(), EventMsg::ExecCommandOutputDelta(event))
@@ -204,14 +211,14 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     duration: Duration,
 ) {
     let aggregated_output = resolve_aggregated_output(&transcript, fallback_output).await;
-    let output = ExecToolCallOutput {
+    let output = sanitize_exec_output(&ExecToolCallOutput {
         exit_code,
         stdout: StreamOutput::new(aggregated_output.clone()),
         stderr: StreamOutput::new(String::new()),
         aggregated_output: StreamOutput::new(aggregated_output),
         duration,
         timed_out: false,
-    };
+    });
     let event_ctx = ToolEventCtx::new(
         session_ref.as_ref(),
         turn_ref.as_ref(),
@@ -241,20 +248,26 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     message: String,
     duration: Duration,
 ) {
-    let stdout = resolve_aggregated_output(&transcript, String::new()).await;
+    let stdout = sanitize_output_text(
+        resolve_aggregated_output(&transcript, String::new())
+            .await
+            .as_str(),
+    )
+    .text;
+    let sanitized_message = sanitize_output_text(message.as_str()).text;
     let aggregated_output = if stdout.is_empty() {
-        message.clone()
+        sanitized_message.clone()
     } else {
-        format!("{stdout}\n{message}")
+        format!("{stdout}\n{sanitized_message}")
     };
-    let output = ExecToolCallOutput {
+    let output = sanitize_exec_output(&ExecToolCallOutput {
         exit_code: -1,
         stdout: StreamOutput::new(stdout),
-        stderr: StreamOutput::new(message),
+        stderr: StreamOutput::new(sanitized_message),
         aggregated_output: StreamOutput::new(aggregated_output),
         duration,
         timed_out: false,
-    };
+    });
     let event_ctx = ToolEventCtx::new(
         session_ref.as_ref(),
         turn_ref.as_ref(),

@@ -8,6 +8,7 @@ use pretty_assertions::assert_eq;
 
 use crate::exec_env::create_env;
 use crate::sandboxing::SandboxPermissions;
+use crate::sensitive_output::sensitive_command_block;
 use crate::session::tests::make_session_and_context;
 use crate::shell::Shell;
 use crate::shell::ShellType;
@@ -188,6 +189,39 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
             .user_shell()
             .derive_exec_args("echo hello", /*use_login_shell*/ false)
     );
+}
+
+#[tokio::test]
+async fn shell_command_handler_marks_git_show_sensitive_git_specs_as_blocked() {
+    let (session, turn_context) = make_session_and_context().await;
+    let params = ShellCommandToolCallParams {
+        command: "git show HEAD:.env".to_string(),
+        workdir: None,
+        login: None,
+        timeout_ms: None,
+        sandbox_permissions: None,
+        additional_permissions: None,
+        prefix_rule: None,
+        justification: None,
+    };
+
+    let exec_params = ShellCommandHandler::to_exec_params(
+        &params,
+        &session,
+        &turn_context,
+        session.conversation_id,
+        /*allow_login_shell*/ true,
+    )
+    .expect("shell command params should resolve");
+
+    let blocked = sensitive_command_block(&exec_params.command).unwrap_or_else(|| {
+        panic!(
+            "shell command should be blocked, argv was {:?}",
+            exec_params.command
+        )
+    });
+
+    assert_eq!(blocked.path, ".env");
 }
 
 #[test]

@@ -15,6 +15,7 @@
 //! bridging async `mpsc` channels on both sides. Queues are bounded so overload
 //! surfaces as channel-full errors rather than unbounded memory growth.
 
+mod dynamic_tools;
 mod remote;
 
 use std::error::Error;
@@ -61,6 +62,9 @@ use tracing::warn;
 
 pub use crate::remote::RemoteAppServerClient;
 pub use crate::remote::RemoteAppServerConnectArgs;
+pub use dynamic_tools::delegate_dynamic_tool_response;
+pub use dynamic_tools::dynamic_tool_failure_response;
+pub use dynamic_tools::execute_dynamic_tool_call;
 
 /// Transitional access to core-only embedded app-server types.
 ///
